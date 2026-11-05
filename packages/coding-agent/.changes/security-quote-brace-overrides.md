@@ -1,0 +1,1 @@
+- Updated shell quoting and brace expansion dependencies to fixed security patch versions.
