@@ -15,7 +15,8 @@ export default function (pi: ExtensionAPI) {
 		return;
 	}
 	const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-	if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.search || url.hash || url.pathname !== "/") return;
+	// This opt-in sends the bearer token and request data in plaintext over HTTP.
+	if ((url.protocol !== "https:" && !(url.protocol === "http:" && (loopback || process.env.ENVINHANDS_ALLOW_INSECURE_HTTP === "1"))) || url.username || url.password || url.search || url.hash || url.pathname !== "/") return;
 	const endpoint = new URL("/v1/agents/heartbeat", url);
 	let active = false;
 	let timer: ReturnType<typeof setInterval> | undefined;

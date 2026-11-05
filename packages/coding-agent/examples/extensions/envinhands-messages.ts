@@ -30,7 +30,8 @@ export default function (pi: ExtensionAPI) {
  let origin: URL;
  try { origin = new URL(base); } catch { return; }
  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname);
- if ((origin.protocol !== "https:" && !(origin.protocol === "http:" && loopback)) || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/") return;
+ // This opt-in sends the bearer token and request data in plaintext over HTTP.
+ if ((origin.protocol !== "https:" && !(origin.protocol === "http:" && (loopback || process.env.ENVINHANDS_ALLOW_INSECURE_HTTP === "1"))) || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/") return;
  let pending = 0;
  // Caller-controlled and server-controlled data are never used in errors.
  async function request(path: string, method: "GET" | "POST", body: unknown, signal?: AbortSignal): Promise<unknown> {

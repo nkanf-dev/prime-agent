@@ -1,9 +1,10 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension from "../packages/coding-agent/examples/extensions/envinhands-messages";
 
-const keys = ["ENVINHANDS_URL", "ENVINHANDS_TOKEN", "ENVINHANDS_AGENT_ID"] as const;
+const keys = ["ENVINHANDS_URL", "ENVINHANDS_TOKEN", "ENVINHANDS_AGENT_ID", "ENVINHANDS_ALLOW_INSECURE_HTTP"] as const;
 const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+beforeEach(() => { delete process.env.ENVINHANDS_ALLOW_INSECURE_HTTP; });
 afterEach(() => {
 	for (const key of keys) {
 		if (previous[key] === undefined) delete process.env[key];
@@ -214,4 +215,57 @@ test("send retries reuse the caller's requestId and identical payload", async ()
 		for (let i = 0; i < 2; i++) expect(text(await call(tools, names[1], params))).toMatch(/accepted/i);
 		expect(bodies).toEqual([ { ...params, from: "agent-1" }, { ...params, from: "agent-1" } ]);
 	} finally { server.stop(true); }
+});
+
+test("non-loopback HTTP requires the exact opt-in and still rejects unsafe URLs", () => {
+	config("http://192.0.2.1:1234");
+	for (const value of [undefined, "", "0", "true", "yes", " 1", "1 "]) {
+		if (value === undefined) delete process.env.ENVINHANDS_ALLOW_INSECURE_HTTP;
+		else process.env.ENVINHANDS_ALLOW_INSECURE_HTTP = value;
+		expect(load().size).toBe(0);
+	}
+	delete process.env.ENVINHANDS_ALLOW_INSECURE_HTTP;
+	for (const url of ["https://192.0.2.1", "http://127.0.0.1:1234"]) {
+		config(url);
+		expect([...load().keys()].sort()).toEqual([...names].sort());
+	}
+	config("http://192.0.2.1:1234");
+	process.env.ENVINHANDS_ALLOW_INSECURE_HTTP = "1";
+	expect([...load().keys()].sort()).toEqual([...names].sort());
+	delete process.env.ENVINHANDS_TOKEN;
+	expect(load().size).toBe(0);
+	config("http://192.0.2.1:1234");
+	process.env.ENVINHANDS_AGENT_ID = "bad/id";
+	expect(load().size).toBe(0);
+	for (const url of ["ftp://192.0.2.1/", "file:///tmp/socket", "http://u:p@192.0.2.1/", "http://192.0.2.1/path", "http://192.0.2.1/?q=x", "http://192.0.2.1/#x"]) {
+		config(url);
+		expect(load().size).toBe(0);
+	}
+});
+
+test("opted-in non-loopback messages keep redirect protection", async () => {
+	let leaked = false;
+	let auth: string | null = null;
+	const target = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { leaked = true; return Response.json({ agents: [] }); } });
+	const source = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+		auth = req.headers.get("authorization");
+		return Response.redirect(`http://127.0.0.1:${target.port}/`, 302);
+	} });
+	const originalFetch = globalThis.fetch;
+	const urls: string[] = [];
+	globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+		const url = new URL(String(input));
+		urls.push(url.href);
+		// Route the documentation-only address to a local server; never contact the network address.
+		return originalFetch(`http://127.0.0.1:${source.port}${url.pathname}`, init);
+	}) as typeof fetch;
+	try {
+		config("http://192.0.2.1:1234");
+		process.env.ENVINHANDS_ALLOW_INSECURE_HTTP = "1";
+		const output = text(await call(load(), names[0], {}));
+		expect(output).toMatch(/fail|error/i);
+		expect(urls).toEqual(["http://192.0.2.1:1234/v1/agents"]);
+		expect(auth).toBe("Bearer test-secret");
+		expect(leaked).toBe(false);
+	} finally { globalThis.fetch = originalFetch; source.stop(true); target.stop(true); }
 });

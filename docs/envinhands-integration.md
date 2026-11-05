@@ -83,11 +83,27 @@ export ENVINHANDS_MACHINE_ID=machine-example
 ```
 
 Absent or invalid configuration disables the extension silently. The URL must
-be a root origin without credentials, query or fragment. Plain HTTP is restricted
-to localhost/loopback; other hosts require HTTPS. This URL validation is not a
-substitute for securing the server, verifying its identity and authorization,
-or a security audit. Protect environment access and use appropriate server-side
-logging rules because the bearer token is an HTTP authorization header.
+be a root origin without credentials, query or fragment. By default, plain HTTP
+is allowed only for localhost/loopback; other hosts require HTTPS. Setting
+`ENVINHANDS_ALLOW_INSECURE_HTTP=1` before starting the agent also permits HTTP to
+non-loopback hosts. The value must be exactly `1`. This opt-in affects URL
+validation, not transport security.
+
+**Use non-loopback HTTP only on a trusted private network.** The shared bearer
+key and heartbeat data travel in plaintext and can be read or changed by anyone
+who can observe or intercept the traffic. If the message extension uses HTTP,
+message contents also travel in plaintext. Prefer HTTPS with a properly configured
+and authenticated proxy for cross-machine traffic. URL validation does not secure
+the server, verify identity or authorization, or replace a security audit. Protect
+environment access and use appropriate server-side logging rules because the
+bearer token is an HTTP authorization header.
+
+A service bound to `0.0.0.0` listens on all IPv4 interfaces; it is not a client
+destination or an access control. Use a reachable host address in `ENVINHANDS_URL`
+and restrict service access with firewall rules. Binding broadly can expose the
+service beyond the intended network. FRP or another tunnel can also expose the
+service: do not assume it encrypts or authenticates the full path. Verify its
+configuration and exposure, or use a properly secured HTTPS endpoint instead.
 
 At session start, agent start, agent end and session shutdown the extension sends
 a best-effort heartbeat with a fixed lifecycle string in `task`; every 30 seconds
