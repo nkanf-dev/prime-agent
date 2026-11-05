@@ -22,14 +22,14 @@ test("disabled without explicit configuration and unsafe URL", () => {
 	expect(load().size).toBe(0);
 });
 
-test("lifecycle sends only fixed fields to loopback and does not block", async () => {
+test.each([204, 503])("lifecycle sends only fixed fields to loopback and does not block on status %s", async (status) => {
 	const received: { path: string; auth: string | null; body: unknown }[] = [];
 	let complete!: () => void;
 	const allReceived = new Promise<void>((resolve) => { complete = resolve; });
 	const server = Bun.serve({ port: 0, hostname: "127.0.0.1", async fetch(req) {
 		received.push({ path: new URL(req.url).pathname, auth: req.headers.get("authorization"), body: await req.json() });
 		if (received.length === 4) complete();
-		return new Response(null, { status: 204 });
+		return new Response(null, { status });
 	} });
 	try {
 		process.env.ENVINHANDS_URL = `http://127.0.0.1:${server.port}`;
