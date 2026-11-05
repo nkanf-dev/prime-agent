@@ -41,6 +41,13 @@ on a trusted private network, each agent process must explicitly set
 separately to advertise each agent. Loading message tools alone does not register
 activity.
 
+An attached view or inherited subagent is not automatically a separately
+configured EnvInHands participant. These tools capture configuration when loaded;
+initial multi-client acceptance must use independent top-level runtimes with
+distinct Agent IDs, not multiple views of one session. See the
+[multi-client validation plan](envinhands-multi-client-validation.md) for real
+loader, control-host, client restart and cross-machine acceptance requirements.
+
 ## Tools
 
 Call tools explicitly. IDs use the pattern above. `text` must be nonblank and

@@ -1,0 +1,1 @@
+- Fixed loading local extensions from an unbuilt TypeScript workspace.

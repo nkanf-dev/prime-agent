@@ -136,9 +136,16 @@ With Bun and this checkout's dependencies installed, run:
 bun test scripts/envinhands-resources.test.ts
 ```
 
-Tests use loopback mock servers. If a sibling `envinhands` checkout is present,
-they also exercise its real machine API with an in-memory SQLite database and a
-mock verifier; no SSH connection is made. Set `ENVINHANDS_MACHINE_API_TEST_PATH`
-to that checkout's `src/machine-api.ts` when it lives elsewhere. This optional
-integration test is skipped if the file is absent. These tests do not contact a
-public service or prove remote deployment security.
+The Prime suite is self-contained and uses loopback mocks with real TypeBox.
+Its deadline test uses a controlled production timer and abort signal, not a
+wall-clock readiness wait. The former optional sibling-checkout test moved to
+EnvInHands `test/prime-adapter.test.ts`; that explicit integration preserves
+machine registration, ready listing, notes, resource separation and auth negatives.
+An external real-loader harness also calls these actual Prime resource tools
+against `createMachineApi`. The verifier is a mock, not an SSH/admin check.
+
+These local suites and the policy gate have passed in the current checkout;
+they do not prove independent OS clients, each client's SSH identity, remote
+readiness or deployment security. See the
+[multi-client validation plan](envinhands-multi-client-validation.md) for remaining
+control-host and cross-machine acceptance work.

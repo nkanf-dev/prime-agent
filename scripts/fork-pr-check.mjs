@@ -91,7 +91,10 @@ function shuffledCommand(pkg, tests, seed) {
 		}
 		return ["node", [...flags.filter((flag) => !flag.includes("*")), `--test-random-seed=${seed}`, ...tests]];
 	}
-	return ["npx", ["vitest", "--run", "--sequence.shuffle", `--sequence.seed=${seed}`, ...tests]];
+	return [
+		process.execPath,
+		[resolve(root, "node_modules/vitest/dist/cli.js"), "--run", "--sequence.shuffle", `--sequence.seed=${seed}`, ...tests],
+	];
 }
 
 function runShuffled(files) {

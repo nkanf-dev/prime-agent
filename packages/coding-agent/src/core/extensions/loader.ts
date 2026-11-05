@@ -39,8 +39,12 @@ let _aliases: Record<string, string> | null = null;
 function getAliases(): Record<string, string> {
 	if (_aliases) return _aliases;
 
-	const __dirname = path.dirname(fileURLToPath(import.meta.url));
-	const packageIndex = path.resolve(__dirname, "../..", "index.js");
+	const filename = fileURLToPath(import.meta.url);
+	const __dirname = path.dirname(filename);
+	const sourceMode = path.extname(filename) === ".ts";
+	const entryExtension = sourceMode ? "ts" : "js";
+	const workspaceDirectory = sourceMode ? "src" : "dist";
+	const packageIndex = path.resolve(__dirname, "../..", `index.${entryExtension}`);
 
 	const typeboxEntry = require.resolve("typebox");
 	const typeboxCompileEntry = require.resolve("typebox/compile");
@@ -57,10 +61,22 @@ function getAliases(): Record<string, string> {
 	};
 
 	const piCodingAgentEntry = packageIndex;
-	const piAgentCoreEntry = resolveWorkspaceOrImport("agent/dist/index.js", "@earendil-works/pi-agent-core");
-	const piTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "@earendil-works/pi-tui");
-	const piAiEntry = resolveWorkspaceOrImport("ai/dist/index.js", "@earendil-works/pi-ai");
-	const piAiOauthEntry = resolveWorkspaceOrImport("ai/dist/oauth.js", "@earendil-works/pi-ai/oauth");
+	const piAgentCoreEntry = resolveWorkspaceOrImport(
+		`agent/${workspaceDirectory}/index.${entryExtension}`,
+		"@earendil-works/pi-agent-core",
+	);
+	const piTuiEntry = resolveWorkspaceOrImport(
+		`tui/${workspaceDirectory}/index.${entryExtension}`,
+		"@earendil-works/pi-tui",
+	);
+	const piAiEntry = resolveWorkspaceOrImport(
+		`ai/${workspaceDirectory}/index.${entryExtension}`,
+		"@earendil-works/pi-ai",
+	);
+	const piAiOauthEntry = resolveWorkspaceOrImport(
+		`ai/${workspaceDirectory}/oauth.${entryExtension}`,
+		"@earendil-works/pi-ai/oauth",
+	);
 
 	_aliases = {
 		"@earendil-works/pi-coding-agent": piCodingAgentEntry,

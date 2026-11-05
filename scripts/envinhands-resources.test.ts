@@ -1,5 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension from "../packages/coding-agent/examples/extensions/envinhands-resources";
@@ -150,37 +149,14 @@ test("redirects cannot forward bearer credentials", async () => {
  } finally { source.stop(true); target.stop(true); }
 });
 
-test("a stalled server does not hold a tool indefinitely or reveal its token", async () => {
- const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() { return await new Promise<Response>(() => {}); } });
+test("the request deadline aborts a stalled transport without revealing its token", async () => {
+ let deadline: (() => void) | undefined;
+ const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, delay: number) => { expect(delay).toBe(2000); deadline = callback; return 1; }) as typeof setTimeout);
+ const clear = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+ const transport = spyOn(globalThis, "fetch").mockImplementation((_input, init) => new Promise<Response>((_resolve, reject) => init!.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true })));
  try {
-  config(`http://127.0.0.1:${server.port}`); const started = performance.now();
-  const result = await output(load(), list, {});
-  expect(performance.now() - started).toBeLessThan(3500);
-  expect(result).toMatch(/fail|error|timeout|timed out/i); expect(result).not.toContain("test-secret");
- } finally { server.stop(true); }
-}, 5000);
-
-// The separate EnvInHands checkout is optional; this exercises its real SQLite-backed handler when present.
-const machineApiPath = process.env.ENVINHANDS_MACHINE_API_TEST_PATH ?? new URL("../../envinhands/src/machine-api.ts", import.meta.url).pathname;
-(existsSync(machineApiPath) ? test : test.skip)("real machine API: list ready machines and persist notes by resource", async () => {
- const { createMachineApi } = await import(machineApiPath);
- const api = createMachineApi({ dbPath: ":memory:", token: "test-secret", verifier: async () => ({ status: "ready", ready: true, message: "verified" }) });
- const direct = (path: string, method = "GET", body?: unknown) => api.fetch(new Request(`http://local.test${path}`, {
-  method, headers: { authorization: "Bearer test-secret", "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
- }));
- const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: api.fetch });
- try {
-  expect((await direct("/v1/machines", "POST", { id: "machine-1", name: "Build node", host: "host.local", os: "linux", sshUser: "admin" })).status).toBe(202);
-  expect((await direct("/v1/machines/machine-1/verify", "POST")).status).toBe(200);
-  config(`http://127.0.0.1:${server.port}`); const tools = load();
-  expect(text(await call(tools, list, {}))).toContain("machine-1");
-  const submitted = text(await call(tools, add, { resourceId: "machine-1", text: "persistent note" }));
-  expect(submitted).not.toMatch(/invalid|failed|error/i);
-  const read = text(await call(tools, notes, { resourceId: "machine-1" }));
-  expect(read).toContain("persistent note"); expect(read).toContain("agent-1");
-  const persisted = await (await direct("/v1/resources/machine-1/messages")).json();
-  expect(persisted.messages).toHaveLength(1);
-  expect(persisted.messages[0]).toMatchObject({ resourceId: "machine-1", author: "agent-1", text: "persistent note" });
-  expect((await (await direct("/v1/resources/other/messages")).json()).messages).toEqual([]);
- } finally { server.stop(true); api.close(); }
+  config("http://127.0.0.1:1234"); const pending = output(load(), list, {});
+  expect(deadline).toBeDefined(); deadline!();
+  expect(await pending).toMatch(/fail|error|timeout|timed out/i); expect(await pending).not.toContain("test-secret");
+ } finally { transport.mockRestore(); clear.mockRestore(); timer.mockRestore(); }
 });

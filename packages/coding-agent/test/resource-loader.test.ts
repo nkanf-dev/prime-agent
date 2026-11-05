@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
@@ -32,6 +32,36 @@ describe("DefaultResourceLoader", () => {
 			process.env.SERPER_API_KEY = previousSerperApiKey;
 		}
 		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it.each([
+		["heartbeat", []],
+		["messages", ["envinhands_list_agents", "envinhands_send", "envinhands_pull", "envinhands_ack"]],
+		["resources", ["envinhands_list_resources", "envinhands_resource_notes", "envinhands_add_resource_note"]],
+	] as const)("loads the opt-in EnvInHands %s adapter from source", async (name, tools) => {
+		for (const [key, value] of Object.entries({
+			ENVINHANDS_URL: "http://127.0.0.1:8787",
+			ENVINHANDS_TOKEN: "loader-fixture",
+			ENVINHANDS_AGENT_ID: "loader-agent",
+			ENVINHANDS_MACHINE_ID: "loader-machine",
+		}))
+			vi.stubEnv(key, value);
+		try {
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				additionalExtensionPaths: [join(process.cwd(), `examples/extensions/envinhands-${name}.ts`)],
+			});
+			await loader.reload();
+			const result = loader.getExtensions();
+			expect(result.errors).toEqual([]);
+			expect(result.extensions.flatMap((extension) => [...extension.tools.keys()])).toEqual(tools);
+			expect([...result.extensions[0].handlers.keys()]).toEqual(
+				name === "heartbeat" ? ["session_start", "agent_start", "agent_end", "session_shutdown"] : [],
+			);
+		} finally {
+			vi.unstubAllEnvs();
+		}
 	});
 
 	describe("resource precedence", () => {
@@ -110,8 +140,12 @@ Project skill`,
 
 			mkdirSync(agentDir, { recursive: true });
 			mkdirSync(join(cwd, ".prime", "agent"), { recursive: true });
-			symlinkSync(sharedExtDir, join(agentDir, "extensions"), "dir");
-			symlinkSync(sharedExtDir, join(cwd, ".prime", "agent", "extensions"), "dir");
+			symlinkSync(sharedExtDir, join(agentDir, "extensions"), process.platform === "win32" ? "junction" : "dir");
+			symlinkSync(
+				sharedExtDir,
+				join(cwd, ".prime", "agent", "extensions"),
+				process.platform === "win32" ? "junction" : "dir",
+			);
 
 			const loader = new DefaultResourceLoader({ cwd, agentDir });
 			await loader.reload();
@@ -188,7 +222,7 @@ Project override.`,
 			await loader.reload();
 
 			const extensionsResult = loader.getExtensions();
-			expect(extensionsResult.extensions).toHaveLength(2);
+			expect(extensionsResult.extensions, JSON.stringify(extensionsResult.errors)).toHaveLength(2);
 			expect(extensionsResult.errors.some((e) => e.error.includes('Command "/deploy" conflicts'))).toBe(false);
 
 			const sessionManager = SessionManager.inMemory();

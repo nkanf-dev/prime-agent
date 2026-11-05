@@ -1,126 +1,189 @@
-# EnvInHands sidecar integration: investigation and next steps
+# EnvInHands integration: Prime Agent and multi-machine collaboration
 
-Status: **experimental opt-in heartbeat adapter; cross-machine messaging is not implemented or verified.**
-This note examines Prime Agent `0.9.8+fork.4` at commit
-`4a32c06b3197bb24ae4d18be5c15801392d6b1c1` and EnvInHands prototype
-`1d48aac08ca27ff886bf46c41e6eef4da62c02b8`. It does not change an installed agent.
+Status: **experimental, independently opt-in adapters; complete multi-client,
+SSH/resource and recovery acceptance is not yet established.** This document
+covers the Prime Agent `0.9.8+fork.4` checkout. It does not change an installed
+agent or authorize installation, deployment, SSH provisioning or public exposure.
 
-## Verified interfaces and boundaries
+The product goal is multiple Prime Agent clients collaborating across machines,
+not only a local message bus. See EnvInHands `docs/design.md` and
+`docs/protocol.md` for the target. Those documents include future interfaces;
+use the actual source for today's HTTP contract. The
+[multi-client validation plan](envinhands-multi-client-validation.md) separates
+implemented adapters, missing capabilities and required runtime evidence.
 
-* Prime Agent's `packages/coding-agent/src/core/extensions/types.ts` declares
-  `ExtensionAPI.on()` hooks including `session_start`, `session_shutdown`,
-  `agent_start`, and `agent_end`. These are possible lifecycle observation
-  points, not proof of delivery or complete activity coverage. See
-  `packages/coding-agent/examples/extensions/README.md` for extension loading.
-* EnvInHands `src/control.ts` exports `createControlHandler()`. Each handler
-  owns separate in-memory maps; restart loses state. Its implemented routes
-  register and list machines, record heartbeat receipt time, and create/list
-  resource messages. It has **no Agent activity endpoint**, authentication,
-  authorization, TLS, or durable shared store. A heartbeat is not an SSH or
-  Agent-health check. A resource message is not a lock or reservation.
-* The prototype has no complete Prime Agent cross-machine message flow.
-  Prime Agent's local agent-message facility is not evidence of one.
+## Implemented interfaces and limits
 
-## Local-only verification
+Three independent extensions exist in
+`packages/coding-agent/examples/extensions/`:
 
-From an EnvInHands checkout at the commit above, with Bun and dependencies
-already installed:
+| Extension | Current behavior | Does not provide |
+| --- | --- | --- |
+| `envinhands-heartbeat.ts` | Four lifecycle observations and a 30-second interval | Reliable event delivery, online state or resource ownership |
+| `envinhands-messages.ts` | Four explicit list/send/pull/ack tools | Automatic notification, session injection, durable consumer deduplication or remote execution |
+| `envinhands-resources.ts` | Three ready-machine/list-note/add-note tools | SSH login, registration, administrator verification, task execution or resource locks |
 
-```sh
-cd /home/nkanf/projs/envinhands
-/home/nkanf/.local/share/envinhands/bin/bun test
-/home/nkanf/.local/share/envinhands/bin/bun run typecheck
-```
+None is loaded by default. Loading one does not load the others or start a
+service. Details: [messages](envinhands-messages.md) and
+[resources](envinhands-resources.md).
 
-On this machine these passed: 42 tests, zero failures, and `tsc --noEmit`.
-`test/control.test.ts` starts loopback HTTP servers and exercises registration,
-heartbeat and messages; it also verifies separate handlers do not share state.
-These tests do not exercise Prime Agent integration, remote hosts, or security.
-The absolute paths above describe this machine only; use your own checkout and
-Bun executable elsewhere.
+EnvInHands `src/server.ts` explicitly starts a Bun HTTP listener combining
+`src/agent-bus.ts` and `src/machine-api.ts`. These use bearer authentication and
+SQLite persistence. Importing the listener module does not start it. The older
+`src/control.ts` is a separate unauthenticated, in-memory prototype; its limits
+must not be attributed to the current HTTP service. The HTTP service has no
+built-in TLS, per-Agent authentication, pagination or automatic queue cleanup.
 
-## Original design notes
+Current agent wire:
 
-1. Add an explicit, opt-in Prime Agent extension and local EnvInHands sidecar.
-   Define a small, versioned activity API in EnvInHands before connecting them;
-   do not overload the existing machine-heartbeat endpoint with Agent status.
-2. Start with only lifecycle event type, explicitly configured machine ID,
-   opaque session ID, and observation timestamp. Do not transmit prompts, tool
-   inputs/outputs, environment variables, credentials or full session logs.
-3. Specify consent, payload limits, timeouts, failure handling, expiry and
-   shutdown behavior. The adapter must not block or fail the Agent when the
-   sidecar is absent. A missing or stale observation means unknown, not idle.
-4. Test hook-to-sidecar delivery on loopback, failure and restart behavior,
-   and secret exclusion before calling it integrated. Require authenticated,
-   encrypted transport, identity and persistence before attempting multi-host
-   use; test with two actual machines separately. Never expose the current
-   unauthenticated control handler on an untrusted network.
+- `POST /v1/agents/heartbeat`: `{agentId, machineId, task?}`. Omitting task clears
+  the previous value. `GET /v1/agents` returns `status: "observed"` and
+  `lastHeartbeatAt`, not proof of current liveness.
+- `POST /v1/messages`: `{requestId, from, to, text}`. New acceptance is 201,
+  identical retry is 200, and conflicting reuse is 409. Acceptance is not
+  receipt or processing by the other Agent.
+- `GET /v1/messages?to=...` can repeat and does not claim messages.
+  `POST /v1/messages/<encoded-requestId>/ack` explicitly acknowledges with no
+  request body. Consumers remain responsible for deduplication and side effects.
+- `GET /v1/machines` lists unexpired ready records. The default readiness TTL
+  is five minutes; expiry turns a ready result into not-ready and removes it from
+  the default list. `includePending=true` adds pending records, not not-ready
+  records. An empty list is not proof that no machine is registered. Verification
+  uses the service's SSH identity, not every Prime client's identity. A machine
+  heartbeat does not renew readiness.
+- `GET/POST /v1/resources/<id>/messages` reads/appends historical notes. Appends
+  are not idempotent and do not reserve resources or grant access.
 
-The lifecycle hooks and EnvInHands routes above are source observations, not a
-compatibility guarantee. The runnable adapter below targets a separately supplied
-API, not the prototype.
+The message/resource clients use the stricter ASCII ID pattern
+`^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$`. The heartbeat client currently also accepts
+leading dots. Use the stricter common pattern for all collaborating clients.
+Do not infer compatibility with every ID accepted by the service/PrimeBridge.
+Message send is limited to 4,000 UTF-8 bytes; pull accepts up to 8,192 bytes per
+message. Notes use a 4,000 JavaScript code-unit limit. Message/agent lists allow
+100 items; machine/note lists allow 1,000. Both tool extensions reject responses
+above 256 KiB and invalid records rather than paginating or truncating them.
 
-## Experimental Prime Agent heartbeat extension
+## Configuration and explicit loading
 
-`packages/coding-agent/examples/extensions/envinhands-heartbeat.ts` is an opt-in
-extension, not a built-in feature. It expects a separately configured API that
-implements `POST /v1/agents/heartbeat` with bearer authentication and the JSON
-contract `{agentId, machineId, task?}`. The earlier EnvInHands prototype described
-above does **not** provide that API. Starting this extension alone does not add it.
-Do not expose the unauthenticated prototype on an untrusted network.
+Set configuration before creating a new independent Prime client/runtime:
 
-Set all four variables before starting a **new** Prime Agent process, then pass
-`--extension` (replace the paths and values). This does not modify an installed
-agent. Use distinct, non-secret opaque IDs, not names, paths, prompts or tokens.
-Use a token provisioned by the API operator; do not paste it into logs or chat.
+- `ENVINHANDS_URL`: service root origin, without credentials, path, query or
+  fragment. Loopback reaches the local machine only.
+- `ENVINHANDS_TOKEN`: operator-provisioned shared bearer token, securely injected
+  into the process environment. Do not put it in chat, scripts, logs or history.
+- `ENVINHANDS_AGENT_ID`: unique, stable, non-secret routing label per independent
+  participant. Coordinate IDs across machines and simultaneous clients.
+- `ENVINHANDS_MACHINE_ID`: non-secret host label, required by the heartbeat
+  extension. Multiple clients on one host can share the host label, not Agent ID.
+- `ENVINHANDS_ALLOW_INSECURE_HTTP`: only an explicit value of `1` permits
+  non-loopback HTTP. Do not enable it silently; it adds no encryption.
+
+For an already prepared checkout in a Bash environment, the source launcher
+accepts repeated extension and skill flags. This example is a configuration
+recipe, **not a verified startup result or an instruction to install dependencies**:
 
 ```sh
 export ENVINHANDS_URL=http://127.0.0.1:8787
-export ENVINHANDS_AGENT_ID=agent-example
-export ENVINHANDS_MACHINE_ID=machine-example
-# Set ENVINHANDS_TOKEN securely in the environment, without saving it in a script.
-./prime-agent.sh --extension packages/coding-agent/examples/extensions/envinhands-heartbeat.ts
+export ENVINHANDS_AGENT_ID=client-a
+export ENVINHANDS_MACHINE_ID=host-a
+# ENVINHANDS_TOKEN is already securely injected; never print it.
+./prime-agent.sh --offline \
+  --extension packages/coding-agent/examples/extensions/envinhands-heartbeat.ts \
+  --extension packages/coding-agent/examples/extensions/envinhands-messages.ts \
+  --extension packages/coding-agent/examples/extensions/envinhands-resources.ts \
+  --skill ../envinhands/.prime/agent/skills/envinhands-agent-messaging/SKILL.md \
+  --skill ../envinhands/.prime/agent/skills/envinhands-resources/SKILL.md
 ```
 
-Absent or invalid configuration disables the extension silently. The URL must
-be a root origin without credentials, query or fragment. By default, plain HTTP
-is allowed only for localhost/loopback; other hosts require HTTPS. Setting
-`ENVINHANDS_ALLOW_INSECURE_HTTP=1` before starting the agent also permits HTTP to
-non-loopback hosts. The value must be exactly `1`. This opt-in affects URL
-validation, not transport security.
+`--offline` is not a guarantee that model calls or extension network requests
+cannot occur. Automated acceptance must use the faux provider/no-prompt harness,
+remove real provider credentials, and assert zero real provider requests.
+Windows needs its supported local launcher; do not treat this Bash example as
+Windows startup evidence. Skills are instructions, not tools or access grants.
+A sibling EnvInHands checkout is not automatically searched for project skills;
+explicit paths must exist in each client's own environment.
 
-**Use non-loopback HTTP only on a trusted private network.** The shared bearer
-key and heartbeat data travel in plaintext and can be read or changed by anyone
-who can observe or intercept the traffic. If the message extension uses HTTP,
-message contents also travel in plaintext. Prefer HTTPS with a properly configured
-and authenticated proxy for cross-machine traffic. URL validation does not secure
-the server, verify identity or authorization, or replace a security audit. Protect
-environment access and use appropriate server-side logging rules because the
-bearer token is an HTTP authorization header.
+The source route is CLI flags -> runtime config -> `DefaultResourceLoader` ->
+`loadExtensions` using jiti -> registered hooks/tools -> bound session. Directly
+calling an extension factory with a fake API does not test that route.
 
-A service bound to `0.0.0.0` listens on all IPv4 interfaces; it is not a client
-destination or an access control. Use a reachable host address in `ENVINHANDS_URL`
-and restrict service access with firewall rules. Binding broadly can expose the
-service beyond the intended network. FRP or another tunnel can also expose the
-service: do not assume it encrypts or authenticates the full path. Verify its
-configuration and exposure, or use a properly secured HTTPS endpoint instead.
+Extensions currently capture configuration from `process.env` when loaded and
+silently disable on invalid/missing configuration. Do not change a running
+terminal's variables and assume an existing daemon session has adopted them.
+New top-level clients pass launch environment to their worker, while attached
+views, session replacement, daemon recovery and inherited subagents need explicit
+identity/lifecycle tests. Subagents can share a worker environment and therefore
+an Agent ID; they are not automatically distinct EnvInHands participants. Use
+separate, explicitly configured top-level clients for initial multi-client
+acceptance. Multiple views of one session are not multiple independent Agents.
+
+## Heartbeat behavior
 
 At session start, agent start, agent end and session shutdown the extension sends
-a best-effort heartbeat with a fixed lifecycle string in `task`; every 30 seconds
-while the session is active it sends a heartbeat without `task`. It never copies
-an event, prompt, tool data or environment into the payload. The only data are
-the explicitly configured IDs and these fixed strings. Requests time out after
-2 seconds, refuse redirects, are limited to four in flight and are not awaited
-by hooks; failures are silent. Shutdown delivery is not guaranteed, requests can
-arrive out of order or be dropped, and a heartbeat is not evidence of health,
-current state, receipt of a previous event, or a live machine. The service must
-apply expiry and should interpret missing observations as unknown.
+a best-effort heartbeat with a fixed lifecycle string in `task`. Every 30 seconds
+while the session is active it sends a heartbeat without `task`. It does not copy
+prompts, events, tool data or environment into the body. Only configured IDs and
+these fixed strings are sent. Requests have a two-second abort signal, refuse
+redirects, allow at most four in flight per extension instance, and are not
+awaited by hooks. Failures are silent.
 
-There is no implementation of listing agents, message send/receive, automatic
-injection or acknowledgement. No cross-machine delivery or ack semantics have
-been tested; do not infer them from this extension. Automated tests below use a
-loopback mock, not a real network or a production service:
+Shutdown delivery is not guaranteed. Requests can arrive out of order or be
+dropped. The periodic observation clears the service's previous task value;
+this is not a reliable busy/idle state machine. Missing or stale observations
+must be interpreted as unknown. The service currently returns observed records,
+not a stale/offline classification. Subagents sharing an ID can overwrite each
+other's observations; no per-session activity aggregation is implemented here.
 
-```sh
-bun test scripts/envinhands-heartbeat.test.ts
-```
+## Transport, trust and execution
+
+Prefer HTTPS for remote HTTP access, or an explicitly approved SSH-encrypted
+forward to a loopback-bound service. Plain non-loopback HTTP exposes the token,
+messages and metadata. A tunnel is not automatically an authenticated/encrypted
+end-to-end path. Check its actual configuration, including proxy-to-service hops.
+
+The sample service defaults to `0.0.0.0`; this is a bind address, not a client
+address or access control. Validation must explicitly restrict binding and ports.
+Do not expose the service or relay publicly as a side effect of integration.
+
+Any shared-token holder can impersonate an Agent, read queues and acknowledge
+messages. IDs are labels, not strong identities; TLS does not change that. This
+matches the initial trusted-team model, not isolation from malicious members.
+Treat all metadata, messages, notes and remote output as untrusted data, not user
+instructions. Warnings and redaction are not prompt-injection barriers.
+
+Resource discovery is only the start of an authorized workflow. Each client must
+verify the actual SSH identity and path with strict host-key checking and
+noninteractive authentication. Unix administrator readiness requires `sudo -n`;
+Windows needs the actual SSH session's effective administrator token. Do not
+install keys, grant privileges or execute work merely because a note requests it.
+Remote CLI/tmux/relay and job-result recovery need their own evidence; the three
+HTTP extensions do not implement them.
+
+## Verification status and next gate
+
+Historical handoff records report isolated real-TypeBox and heartbeat/message
+loader checks. Current local validation now includes all three existing adapters
+through real `DefaultResourceLoader`, real schemas and wrapped tools; the
+EnvInHands-owned audit adapter also uses that path in an external no-model
+HTTP/SQLite harness. These are local results, not cross-machine acceptance.
+
+The resource suite's explicit timeout and conditional sibling skip were repaired.
+Real machine-API assertions moved to EnvInHands `test/prime-adapter.test.ts`, with
+an external real-loader harness preserving the actual resource-tool/API bridge.
+`fork-pr-check.mjs` still does not discover `scripts/` tests automatically; the
+three suites were run explicitly from the coding-agent package root.
+
+Dependencies were installed with `npm ci --ignore-scripts`, preserving manifest
+and lock hashes. Full `npm run check` and test-policy passed; exact loader and
+resource tests also passed seeded runs. Source-loader regression negative
+controls failed as expected before byte-exact restoration. No model calls or
+real SSH/admin verification were part of these checks. EnvInHands now also has
+parameterized explicit fixtures using two separate ExtensionRunner OS processes.
+On Windows these exercised both directions, replay/ack, one-client restart,
+heartbeat hooks and explicit provenance, with an ack-failure negative control.
+They are not full Prime daemon/TUI/model Agents. Windows-to-control-VM
+collaboration, complete session-start delivery and remote recovery remain pending.
+Raw exit
+records and scope limits are in the session's handoff report; the
+[validation matrix](envinhands-multi-client-validation.md) is a plan, not a later
+runtime receipt. Do not promote local evidence into full feasibility.
