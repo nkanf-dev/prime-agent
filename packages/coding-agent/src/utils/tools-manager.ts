@@ -1,4 +1,3 @@
-import extractZip from "extract-zip";
 import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
 import { arch, platform } from "os";
 import { join } from "path";
@@ -6,6 +5,7 @@ import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { APP_NAME, getBinDir } from "../config.js";
 import { spawnSyncHidden } from "./child-process.js";
+import { extractToolZip } from "./extract-tool-zip.js";
 
 const TOOLS_DIR = getBinDir();
 const NETWORK_TIMEOUT_MS = 10_000;
@@ -229,7 +229,7 @@ async function downloadTool(tool: ManagedTool): Promise<string> {
 				throw new Error(`Failed to extract ${assetName}: ${errMsg}`);
 			}
 		} else if (assetName.endsWith(".zip")) {
-			await extractZip(archivePath, { dir: extractDir });
+			await extractToolZip(archivePath, extractDir);
 		} else {
 			throw new Error(`Unsupported archive format: ${assetName}`);
 		}

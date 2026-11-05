@@ -1,0 +1,1 @@
+- Replaced helper ZIP extraction with bounded regular-file-only validation before publishing tool files.
