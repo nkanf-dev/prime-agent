@@ -18,6 +18,7 @@ cp permission-gate.ts ~/.prime/agent/extensions/
 
 | Extension | Description |
 |-----------|-------------|
+| `envinhands-heartbeat.ts` | Experimental opt-in lifecycle heartbeats; see [integration notes](../../../../docs/envinhands-integration.md) |
 | `permission-gate.ts` | Prompts for confirmation before dangerous bash commands (rm -rf, sudo, etc.) |
 | `protected-paths.ts` | Blocks writes to protected paths (.env, .git/, node_modules/) |
 | `confirm-destructive.ts` | Confirms before destructive session actions (clear, switch, fork) |
