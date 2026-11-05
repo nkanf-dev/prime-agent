@@ -81,7 +81,7 @@
 		"@aws-sdk/client-bedrock-runtime": "^3.1095.0",
 		"@google/genai": "^1.40.0",
 		"@mistralai/mistralai": "^2.2.0",
-		"@modelcontextprotocol/sdk": "^1.30.0",
+		"@modelcontextprotocol/sdk": "1.32.0",
 		"openai": "6.47.0",
 		"partial-json": "^0.1.7",
 		"proxy-agent": "^6.5.0",

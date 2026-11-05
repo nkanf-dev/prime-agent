@@ -1,0 +1,1 @@
+- Updated the MCP SDK to address client transport and authentication security advisories.

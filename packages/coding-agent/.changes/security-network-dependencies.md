@@ -1,0 +1,1 @@
+- Updated Undici and the MCP SDK to address networking and client transport security advisories.
