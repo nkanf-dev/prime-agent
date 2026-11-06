@@ -1748,7 +1748,7 @@ export class DefaultPackageManager implements PackageManager {
 			.update(`${prefix}-${suffix ?? ""}`)
 			.digest("hex")
 			.slice(0, 8);
-		return join(tmpdir(), "pi-extensions", prefix, hash, suffix ?? "");
+		return join(tmpdir(), "prime-agent-team-extensions", prefix, hash, suffix ?? "");
 	}
 
 	private getBaseDirForScope(scope: SourceScope): string {

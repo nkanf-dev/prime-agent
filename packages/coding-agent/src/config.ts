@@ -14,6 +14,7 @@ import {
 import { homedir } from "os";
 import { basename, dirname, join, posix, resolve, sep, win32 } from "path";
 import { fileURLToPath } from "url";
+import { bootstrapTeamConfig } from "./team-bootstrap.js";
 import { shouldUseWindowsShell, spawnSyncHidden } from "./utils/child-process.js";
 import { normalizeSocketPath } from "./utils/daemon-socket-path.js";
 import { getNativeInstallationTarget } from "./utils/native-installation.js";
@@ -527,6 +528,9 @@ export function getAgentDir(): string {
 	const envDir = process.env[ENV_AGENT_DIR];
 	if (envDir) {
 		return expandTildePath(envDir);
+	}
+	if (APP_NAME === "prime-agent-team" && CONFIG_DIR_NAME === ".prime-team/agent") {
+		bootstrapTeamConfig(homedir());
 	}
 	return join(homedir(), CONFIG_DIR_NAME);
 }

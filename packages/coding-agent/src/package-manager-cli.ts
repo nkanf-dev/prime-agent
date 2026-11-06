@@ -1565,7 +1565,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		options.command === "update" &&
 		!options.restartCoordinator &&
 		updateTargetIncludesSelf(options.updateTarget ?? { type: "all" }) &&
-		isForkBuild(VERSION)
+		(isForkBuild(VERSION) || APP_NAME === "prime-agent-team")
 	) {
 		console.error(
 			chalk.red(

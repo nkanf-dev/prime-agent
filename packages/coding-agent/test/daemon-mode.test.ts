@@ -4405,7 +4405,10 @@ describe("mesh worker persistence", () => {
 			getOrHydrateBoundSessionState(): Promise<ActiveSessionState>;
 			receiveMeshMessage(
 				client: DaemonSocketClient,
-				command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
+				command: Extract<
+					DaemonWorkerCommand,
+					{ type: "worker_deliver_message" | "worker_native_mesh_deliver_message" }
+				>,
 			): Promise<void>;
 		};
 		internals.assertSupervisorClaimCurrent = async () => "fingerprint";
@@ -4444,6 +4447,117 @@ describe("mesh worker persistence", () => {
 			);
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
+
+	it("native mesh only confirms after persistence and rejects conflicting retries", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		let accepted!: AgentSessionMessage;
+		const accept = vi.fn(async (_: string, options: { customMessage: AgentSessionMessage }) => {
+			accepted = options.customMessage;
+		});
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				acceptAgentMessagePrompt: accept,
+				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+				rejectAgentMessagePrompt: () => undefined,
+				hasQueuedAgentMessage: vi.fn(() => true),
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		h.internals.getOrHydrateBoundSessionState = async () => state;
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "verified-sender" },
+			requestId: `nm1m-${"a".repeat(64)}`,
+			attemptToken: "attempt-1",
+		} as const;
+		// The fixture reports no queue until the first admission.
+		vi.mocked(state.runtime.session.hasQueuedAgentMessage).mockReturnValueOnce(false);
+		await h.internals.receiveMeshMessage(h.client, command);
+		expect(accept).toHaveBeenCalledTimes(1);
+		expect(h.frames().some((f) => f.type === "native_mesh_message_persisted")).toBe(false);
+		await expect(h.internals.receiveMeshMessage(h.client, { ...command, message: "different" })).rejects.toThrow(
+			"conflicts",
+		);
+		await expect(
+			h.internals.receiveMeshMessage(h.client, { ...command, expectedSessionId: "wrong" }),
+		).rejects.toThrow("target session changed");
+		manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details);
+		expect(h.frames().at(-1)).toEqual({
+			type: "native_mesh_message_persisted",
+			requestId: command.requestId,
+			attemptToken: "attempt-1",
+		});
+		await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "attempt-2" });
+		expect(accept).toHaveBeenCalledTimes(1);
+		expect(h.frames().at(-1)).toEqual({
+			type: "native_mesh_message_persisted",
+			requestId: command.requestId,
+			attemptToken: "attempt-2",
+		});
+		await expect(h.internals.receiveMeshMessage(h.client, { ...command, message: "different" })).rejects.toThrow(
+			"conflicts",
+		);
+	});
+
+	it("native mesh does not confirm an fsync failure and retries without another admission", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		let accepted!: AgentSessionMessage;
+		const accept = vi.fn(async (_: string, options: { customMessage: AgentSessionMessage }) => {
+			accepted = options.customMessage;
+		});
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				acceptAgentMessagePrompt: accept,
+				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+				rejectAgentMessagePrompt: () => undefined,
+				hasQueuedAgentMessage: vi.fn(() => true),
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		h.internals.getOrHydrateBoundSessionState = async () => state;
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "verified-sender" },
+			requestId: `nm1m-${"b".repeat(64)}`,
+			attemptToken: "attempt-1",
+		} as const;
+		vi.mocked(state.runtime.session.hasQueuedAgentMessage).mockReturnValueOnce(false);
+		await h.internals.receiveMeshMessage(h.client, command);
+		const sync = vi.spyOn(manager, "syncPersistedEntry").mockImplementation(() => {
+			throw new Error("fsync failed");
+		});
+		manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details);
+		expect(sync).toHaveBeenCalled();
+		expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+		sync.mockRestore();
+		await h.internals.receiveMeshMessage(h.client, command);
+		expect(accept).toHaveBeenCalledTimes(1);
+		expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+			{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: command.attemptToken },
+		]);
+	});
 
 	it.each([false, true])("AC-35 shares admission across supervisor sockets (reject: %s)", async (reject) => {
 		const h = harness();

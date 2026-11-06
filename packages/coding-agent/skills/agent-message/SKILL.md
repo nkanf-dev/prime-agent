@@ -31,7 +31,7 @@ if child is not None:
   lists the parent, siblings, and children this skill can reach, active or not,
   with the `relationship` and `sessionName` that `send` takes as
   `receiver_role` and `receiver_name`.
-- `await agent_message.send(message, receiver_role="parent" | "sibling" | "child", receiver_name=None)` — sends one direct
+- `await agent_message.send(message, receiver_role="parent" | "sibling" | "child", receiver_name=None, operation_id=None)` — sends one direct
   text message to one family member. Sending to an inactive or idle completed
   subagent wakes it and starts an ordinary follow-up turn in that same session
   and context.
@@ -58,6 +58,39 @@ if child is not None:
   and `cotalId`. This proves broker storage, not delivery to the target. It carries
   neither `deliveredAt` nor `queuedAt`. A storage-outcome-unknown error must not be
   retried automatically: a resend can show the message twice.
+
+## Retrying native mesh sends
+
+For a direct native mesh send, supply `operation_id` to identify the logical
+message. It must be a nonblank string, contain no ASCII control characters, and
+be at most 128 UTF-8 bytes. Broadcasts do not accept an operation ID.
+
+Generate and retain the ID **before** sending, so it is available even if the
+whole response is lost. If the outcome is unknown, retry the same message to
+the same target with the same ID. Use a new ID for every independent message;
+do not reuse an ID with a different target or text. For example:
+
+```python
+from uuid import uuid4
+
+operation_id = str(uuid4())  # Save before sending; reuse only for this message.
+receipt = await agent_message.send(
+    "Please inspect the latest result.",
+    receiver_role="child",
+    receiver_name=child.session_name,
+    operation_id=operation_id,
+)
+# If the outcome is unknown, retry the same call with this operation_id.
+```
+
+A retry may temporarily fail during roster resolution while the target is
+offline, even if the durable outbox continues retrying the original operation.
+When the target reappears, retry with the same ID, target, and text.
+
+`operation_id` is accepted only for native mesh sends. Local and Cotal sends
+reject it; they do not ignore it. This does not change Cotal's
+storage-outcome-unknown warning above. Omitting `operation_id` preserves the
+existing send behavior.
 
 ## Safety
 

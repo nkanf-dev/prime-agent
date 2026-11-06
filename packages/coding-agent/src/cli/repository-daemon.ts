@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { ENV_SESSION_DIR } from "../config.js";
 import { defaultDaemonSocketDir, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 
 interface RepositoryDaemon {
@@ -34,7 +35,7 @@ export function resolveRepositoryDaemon(folder: string): ResolvedRepositoryDaemo
 	const [toplevel, commonDir, excludeFile] = result.stdout.trimEnd().split("\n");
 	if (!toplevel || !commonDir || !excludeFile) return undefined;
 	const root = basename(commonDir) === ".git" ? dirname(commonDir) : toplevel;
-	const sessionDir = join(root, basename(root) === ".prime" ? "agent" : ".prime/agent", "sessions");
+	const sessionDir = join(root, basename(root) === ".prime-team" ? "agent" : ".prime-team/agent", "sessions");
 	return { root, sessionDir, socketPath: repositorySocketPath(root), excludeFile };
 }
 
@@ -47,13 +48,13 @@ export function repositoryDaemon(folder: string): RepositoryDaemon | undefined {
 	const cwd = resolve(folder);
 	if (repositories.has(cwd)) {
 		const cached = repositories.get(cwd);
-		if (cached) process.env.PRIME_AGENT_SESSION_DIR = cached.sessionDir;
+		if (cached) process.env[ENV_SESSION_DIR] = cached.sessionDir;
 		return cached;
 	}
 	const daemon = resolveRepositoryDaemon(cwd);
 	if (daemon) {
 		prepareRepositoryDaemon(daemon);
-		process.env.PRIME_AGENT_SESSION_DIR = daemon.sessionDir;
+		process.env[ENV_SESSION_DIR] = daemon.sessionDir;
 		roots.set(daemon.socketPath, daemon.root);
 	}
 	repositories.set(cwd, daemon);
@@ -121,7 +122,7 @@ function prepareSessionFolders(root: string, sessionDir: string, excludeFile: st
 		mkdirSync(dirname(excludeFile), { recursive: true });
 		appendFileSync(
 			excludeFile,
-			`\n# Prime Agent repository sessions\n${missing.map((path) => `/${path}/`).join("\n")}\n`,
+			`\n# Prime Agent Team repository sessions\n${missing.map((path) => `/${path}/`).join("\n")}\n`,
 		);
 	} catch {
 		for (const path of missing) warn(join(root, path));

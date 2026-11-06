@@ -114,7 +114,7 @@ def _agent_dir() -> Path:
     raw = (
         os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
         or os.environ.get("PI_CODING_AGENT_DIR")
-        or str(Path.home() / ".prime" / "agent")
+        or str(Path.home() / ".prime-team" / "agent")
     )
     return Path(raw).expanduser().resolve()
 

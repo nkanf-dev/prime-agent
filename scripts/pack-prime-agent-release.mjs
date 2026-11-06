@@ -21,8 +21,8 @@ import { manifestV1Platforms } from "./release-platforms.mjs";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultOutputDir = join(root, "packages", "coding-agent", "release");
 const defaultBaseUrl = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL;
-const publicPackageName = process.env.PRIME_AGENT_PACKAGE_NAME || "prime-agent";
-const publicCommandName = process.env.PRIME_AGENT_CMD || "prime-agent";
+const publicPackageName = "prime-agent-team";
+const publicCommandName = "prime-agent-team";
 const releaseChannels = new Set(["stable", "beta"]);
 
 const releasePackages = [
@@ -91,6 +91,10 @@ function parseArgs(args) {
 		}
 	}
 
+	if (parsed.binaryDir) {
+		throw new Error("Team native release packing is not supported; use the Node tarball.");
+	}
+
 	if (!parsed.baseUrl) {
 		throw new Error("--base-url or PRIME_AGENT_DOWNLOAD_BASE_URL is required");
 	}
@@ -118,7 +122,7 @@ Add --binary-dir packages/coding-agent/binaries to include every standalone plat
 
 function normalizeVersion(version) {
 	const normalized = version.startsWith("v") ? version.slice(1) : version;
-	if (!/^[0-9A-Za-z.-]+$/.test(normalized)) {
+	if (!/^[0-9A-Za-z.+-]+$/.test(normalized)) {
 		throw new Error(`Invalid release version: ${version}`);
 	}
 	return normalized;
@@ -198,7 +202,7 @@ function createReleasePackageJson(sourcePackage, packageName, releaseVersion, in
 
 	delete packageJson.devDependencies;
 	delete packageJson.overrides;
-	delete packageJson.private;
+	packageJson.private = true;
 
 	if (packageName === publicPackageName) {
 		packageJson.bin = {
@@ -207,7 +211,7 @@ function createReleasePackageJson(sourcePackage, packageName, releaseVersion, in
 		packageJson.piConfig = {
 			...(packageJson.piConfig || {}),
 			name: publicCommandName,
-			configDir: ".prime/agent",
+			configDir: ".prime-team/agent",
 		};
 	}
 

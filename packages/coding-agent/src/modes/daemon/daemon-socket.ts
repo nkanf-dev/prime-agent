@@ -69,7 +69,7 @@ export interface DaemonSocketIdentity {
 
 export function defaultDaemonSocketPath(): string {
 	if (process.platform === "win32") {
-		return "\\\\.\\pipe\\prime-agent-daemon";
+		return "\\\\.\\pipe\\prime-agent-team-daemon";
 	}
 	return join(defaultDaemonSocketDir(), "daemon.sock");
 }
@@ -278,7 +278,7 @@ function assertSocketLeaseHeld(socketPath: string, lease: DaemonSocketPathLease)
 
 export function defaultDaemonSocketDir(): string {
 	const suffix = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-	return join(tmpdir(), `prime-agent-${suffix}`);
+	return join(tmpdir(), `prime-agent-team-${suffix}`);
 }
 
 function ensureDefaultDaemonSocketDir(socketPath: string): void {

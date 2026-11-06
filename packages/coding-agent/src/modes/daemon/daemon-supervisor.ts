@@ -2,6 +2,7 @@ import type { ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
+import { hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import type { CotalMessage } from "@cotal-ai/core";
@@ -176,6 +177,7 @@ import {
 	DAEMON_WORKER_INSTANCE_ID_ENV,
 	DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
 	DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
+	DAEMON_WORKER_NATIVE_MESH_DELIVERY_CAPABILITY,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
@@ -196,6 +198,10 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import { type NativeMeshConfig, nativeMeshConfigFromEnvironment } from "./native-mesh/config.js";
+import { NativeMeshOperations } from "./native-mesh/operations.js";
+import { NativeMeshOutbox } from "./native-mesh/outbox.js";
+import { type NativeMeshObservation, NativeMeshTransport, nativeMeshAgentId } from "./native-mesh/transport.js";
 import {
 	createRlmLedgerRegistrySeedSource,
 	type RlmLedgerEdge,
@@ -337,6 +343,7 @@ interface ResidentWorker {
 	/** worker_auth advertised peer-transport support; absent on workers from older builds. */
 	peerTransportCapable?: boolean;
 	meshDeliveryCapable?: boolean;
+	nativeMeshDeliveryCapable?: boolean;
 	meshReplacementCapable?: boolean;
 	/** In-flight replacement connection during authentication; an allowed frame source alongside client. */
 	pendingClient?: DaemonWorkerClient;
@@ -782,6 +789,18 @@ export class DaemonSupervisor {
 	private readonly agentMessageTransport: "native" | "cotal";
 	private readonly meshCredentialLifetimeSeconds?: number;
 	private mesh?: MeshEndpoints;
+	private readonly nativeMeshConfig?: NativeMeshConfig;
+	private nativeMesh?: NativeMeshTransport;
+	private nativeOutbox?: NativeMeshOutbox;
+	private nativeOperations?: NativeMeshOperations;
+	private nativeMeshTimer?: ReturnType<typeof setInterval>;
+	private nativeMeshSweep?: Promise<void>;
+	private readonly nativeOutboxSends = new Set<Promise<void>>();
+	private nativeObservations = new Map<string, NativeMeshObservation>();
+	private readonly nativeAttempts = new Map<
+		string,
+		{ source: DaemonWorkerClient; token: string; started: number; confirming?: boolean }
+	>();
 	private readonly activeSessionMoves = new Set<string>();
 	private rosterStore?: AgentRoster;
 	private readonly pendingRosterChanged = new Set<string>();
@@ -842,6 +861,15 @@ export class DaemonSupervisor {
 		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
 		this.agentMessageTransport = this.settingsManager.getAgentMessageTransport();
 		this.meshCredentialLifetimeSeconds = options.meshCredentialLifetimeSeconds;
+		const meshEnv = { ...process.env };
+		if (
+			(meshEnv.PRIME_AGENT_TEAM_MESH_URL || meshEnv.PRIME_AGENT_TEAM_MESH_TOKEN) &&
+			meshEnv.PRIME_AGENT_TEAM_MACHINE_ID === undefined
+		)
+			meshEnv.PRIME_AGENT_TEAM_MACHINE_ID = hostname();
+		this.nativeMeshConfig = nativeMeshConfigFromEnvironment(meshEnv);
+		if (this.nativeMeshConfig && this.agentMessageTransport !== "native")
+			throw new Error("Native mesh requires native agent message transport");
 	}
 
 	async start(): Promise<void> {
@@ -870,6 +898,36 @@ export class DaemonSupervisor {
 			this.persistSupervisorConfig();
 			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
 			mkdirSync(this.snapshotCacheRoot, { recursive: true, mode: 0o700 });
+			if (this.nativeMeshConfig) {
+				// Audit attribution is self-declared, not proof of individual identity.
+				const host = this.nativeMeshConfig.machineId;
+				const machineId = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(host)
+					? host
+					: `host-${createHash("sha256").update(host).digest("hex")}`;
+				const registration = Buffer.from(
+					JSON.stringify({
+						registrationId: this.generation,
+						agentId: "prime-agent-supervisor",
+						sessionId: this.generation,
+						machineId,
+						signature: "self-declared; shared bearer token",
+					}),
+				).toString("base64url");
+				this.nativeMesh = new NativeMeshTransport({ ...this.nativeMeshConfig, registration });
+				this.nativeOperations = new NativeMeshOperations(join(this.descriptorDir, "native-mesh-operations"));
+				this.nativeOutbox = new NativeMeshOutbox(
+					join(this.descriptorDir, "native-mesh-outbox"),
+					this.nativeMesh,
+					(id) => {
+						// Older outbox entries predate operation bindings.
+						try {
+							this.nativeOperations!.markStored(id);
+						} catch (error) {
+							if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+						}
+					},
+				);
+			}
 			this.commandJournal = new CommandRecoveryJournal(join(this.descriptorDir, "command-journal.jsonl"));
 			this.loadWorkerDescriptors();
 			const workersToAdopt = [...this.workers.values()];
@@ -952,6 +1010,11 @@ export class DaemonSupervisor {
 			await this.ownership.updatePhase("owner");
 			this.assertSocketLeaseHeld();
 			this.startupComplete = true;
+			if (this.nativeMesh) {
+				this.nativeMeshTimer = setInterval(() => this.scheduleNativeMeshSweep(), 5_000);
+				this.nativeMeshTimer.unref();
+				this.scheduleNativeMeshSweep();
+			}
 			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
 			this.markReady();
 			setImmediate(() => {
@@ -2367,6 +2430,7 @@ export class DaemonSupervisor {
 						const root = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
 						return root ? [this.agentPeerSummary(sessionSummaryFromRosterEntry(root))] : [];
 					});
+				peers.push(...this.nativeMeshPeers());
 				return success(command.id, command.type, { peers });
 			}
 			case "get_direct_worker_transport": {
@@ -3077,6 +3141,13 @@ export class DaemonSupervisor {
 		}
 
 		if (command.type === "send_message") {
+			if (
+				command.nativeMeshOperationId !== undefined &&
+				(!command.fromActiveSessionId ||
+					command.agentOrigin !== true ||
+					!/^nm1-[a-f0-9]{64}$/.test(command.targetActiveSessionId))
+			)
+				throw new Error("operation_id is only supported for remote native mesh messages");
 			if (this.mesh)
 				throw new Error(
 					command.agentOrigin === true
@@ -3092,6 +3163,8 @@ export class DaemonSupervisor {
 				target = await this.findWorkerForClient(client, command.targetActiveSessionId);
 			} catch (error) {
 				if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
+				if (source && command.agentOrigin === true && /^nm1-[a-f0-9]{64}$/.test(command.targetActiveSessionId))
+					return this.sendNativeMeshMessage(command, source.summary);
 				const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
 				let sessionPath: string;
 				try {
@@ -3138,6 +3211,8 @@ export class DaemonSupervisor {
 				if (!summary) throw new Error("Woken session worker has no target session");
 				target = { worker, summary };
 			}
+			if (command.nativeMeshOperationId !== undefined)
+				throw new Error("operation_id is only supported for remote native mesh messages");
 			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
 			if (source) {
 				this.assertAgentMessageOrigin(source.summary, target.summary, command.agentOrigin === true);
@@ -4215,6 +4290,11 @@ export class DaemonSupervisor {
 					}
 					worker.peerTransportCapable = workerAuthAdvertisesPeerTransport(authResponse.data);
 					worker.meshDeliveryCapable = workerAuthAdvertisesMeshDelivery(authResponse.data);
+					worker.nativeMeshDeliveryCapable =
+						Array.isArray((authResponse.data as { capabilities?: unknown })?.capabilities) &&
+						(authResponse.data as { capabilities: unknown[] }).capabilities.includes(
+							DAEMON_WORKER_NATIVE_MESH_DELIVERY_CAPABILITY,
+						);
 					worker.meshReplacementCapable = workerAuthAdvertisesMeshReplacement(authResponse.data);
 					worker.lastFrameAt = Date.now();
 					worker.client?.close();
@@ -4240,6 +4320,312 @@ export class DaemonSupervisor {
 			}
 		}
 		throw new DaemonWorkerProbeTimeoutError(`Timed out connecting to daemon session worker: ${String(lastError)}`);
+	}
+
+	/** Stable session identities, never process-local active IDs or display names. */
+	private nativeLocalEndpoints(): Array<{
+		id: string;
+		parentId: string | null;
+		summary: SessionSummary;
+		worker: ResidentWorker;
+	}> {
+		const config = this.nativeMeshConfig;
+		if (!config) return [];
+		const result: Array<{ id: string; parentId: string | null; summary: SessionSummary; worker: ResidentWorker }> =
+			[];
+		for (const entry of this.roster().values()) {
+			const worker = entry.workerId ? this.workers.get(entry.workerId) : undefined;
+			const summary = sessionSummaryFromRosterEntry(entry);
+			if (
+				!worker ||
+				!worker.client ||
+				!worker.nativeMeshDeliveryCapable ||
+				worker.descriptor.lifecycle !== "ready" ||
+				!summary.activeSessionId ||
+				!summary.sessionId ||
+				!summary.sessionFile ||
+				entry.queuedChild
+			)
+				continue;
+			// An unresolved child must not become a root (and thus gain sibling reach).
+			if ((summary.rlmDepth ?? 0) > 0 && !summary.parentSessionId) continue;
+			try {
+				result.push({
+					id: nativeMeshAgentId(config.machineId, summary.sessionId),
+					parentId: summary.parentSessionId ? nativeMeshAgentId(config.machineId, summary.parentSessionId) : null,
+					summary,
+					worker,
+				});
+			} catch {
+				/* Invalid local identity is not registered. */
+			}
+		}
+		// Never route an endpoint to an ambiguous local session.
+		return result.filter((item) => result.filter((other) => item.id === other.id).length === 1);
+	}
+
+	private nativeObservationDepth(observation: NativeMeshObservation): number | undefined {
+		let depth = 0;
+		let current: NativeMeshObservation | undefined = observation;
+		const seen = new Set<string>();
+		while (current.parentId) {
+			if (seen.has(current.id) || depth >= 64) return undefined;
+			seen.add(current.id);
+			current = this.nativeObservations.get(current.parentId);
+			if (!current) return undefined;
+			depth++;
+		}
+		return depth;
+	}
+
+	private nativeFamilyEntry(observation: NativeMeshObservation): AgentFamilyCatalogEntry | undefined {
+		const depth = this.nativeObservationDepth(observation);
+		if (depth === undefined) return undefined;
+		return {
+			id: observation.id,
+			depth,
+			status: observation.state === "active" ? "idle" : "inactive",
+			...(observation.parentId ? { parentSessionId: observation.parentId } : {}),
+		};
+	}
+
+	private nativeMeshPeers(): AgentSessionMessageAgentSummary[] {
+		if (!this.nativeMeshConfig) return [];
+		return [...this.nativeObservations.values()].flatMap((agent) => {
+			if (
+				agent.hostId === this.nativeMeshConfig!.machineId ||
+				agent.state !== "active" ||
+				Date.now() - Date.parse(agent.lastHeartbeatAt) > 90_000
+			)
+				return [];
+			const depth = this.nativeObservationDepth(agent);
+			if (depth === undefined) return [];
+			return [
+				{
+					activeSessionId: agent.id,
+					sessionId: agent.id,
+					sessionName: agent.name,
+					runtimeKind: depth ? ("subagent" as const) : ("top-level" as const),
+					cwd: "",
+					isStreaming: false,
+					unfinishedActionCount: 0,
+					rlmDepth: depth,
+					status: "idle" as const,
+					...(agent.parentId ? { parentSessionId: agent.parentId, parentActiveSessionId: agent.parentId } : {}),
+				},
+			];
+		});
+	}
+
+	private scheduleNativeMeshSweep(): void {
+		if (this.shuttingDown || this.nativeMeshSweep || !this.nativeMesh) return;
+		this.nativeMeshSweep = this.sweepNativeMesh()
+			.catch(() => {
+				// Never log a broker response or bearer token.
+				if (!this.shuttingDown) this.log("Native mesh synchronization failed; retrying");
+			})
+			.finally(() => {
+				this.nativeMeshSweep = undefined;
+			});
+	}
+
+	private async sweepNativeMesh(): Promise<void> {
+		const transport = this.nativeMesh!;
+		const config = this.nativeMeshConfig!;
+		for (const [id, attempt] of this.nativeAttempts) {
+			if (!attempt.confirming && Date.now() - attempt.started > 120_000) this.nativeAttempts.delete(id);
+		}
+		const endpoints = this.nativeLocalEndpoints();
+		await Promise.allSettled(
+			endpoints.map(async (endpoint) => {
+				const rawPrefix = process.env.PRIME_AGENT_TEAM_DISPLAY_PREFIX?.trim() || config.machineId || hostname();
+				const rawName = endpoint.summary.sessionName?.trim() || endpoint.summary.sessionId;
+				// Name is display-only. It never participates in identity or authorization.
+				const displayName = `${rawPrefix}/${rawName}`;
+				const name =
+					Buffer.byteLength(displayName) <= 128 && !/[\u0000-\u001f\u007f]/.test(displayName)
+						? displayName
+						: endpoint.id;
+				await transport.register({
+					hostId: config.machineId,
+					agentId: endpoint.summary.sessionId,
+					parentId: endpoint.parentId,
+					name,
+					state: "active",
+				});
+			}),
+		);
+		if (this.shuttingDown) return;
+		// The durable binding is also send intent. Recover a crash after binding but
+		// before outbox enqueue; sending twice uses the exact same broker ID.
+		for (const id of this.nativeOperations!.pending()) {
+			const operation = this.nativeOperations!.read(id);
+			this.nativeOutbox!.enqueue({
+				from: operation.from,
+				to: operation.to,
+				text: operation.text,
+				callerMessageId: operation.operationId,
+			});
+		}
+		for (const id of this.nativeOutbox!.pending()) {
+			if (this.shuttingDown) return;
+			void this.sendNativeOutbox(id).catch(() => undefined);
+		}
+		const discovered = await transport.discover();
+		if (this.shuttingDown) return;
+		this.nativeObservations = new Map(discovered.map((entry) => [entry.id, entry]));
+		await Promise.allSettled(
+			endpoints.map(async (endpoint) => {
+				const messages = await transport.pending(endpoint.id);
+				for (const message of messages) {
+					if (this.shuttingDown) return;
+					const old = this.nativeAttempts.get(message.requestId);
+					if (
+						old &&
+						(old.confirming || (Date.now() - old.started < 60_000 && old.source === endpoint.worker.client))
+					)
+						continue;
+					const recipient = this.nativeObservations.get(endpoint.id);
+					const sender = this.nativeObservations.get(message.from);
+					const recipientFamily = recipient && this.nativeFamilyEntry(recipient);
+					const senderFamily = sender && this.nativeFamilyEntry(sender);
+					if (
+						!recipientFamily ||
+						!senderFamily ||
+						message.from === endpoint.id ||
+						!agentFamilyRelationship(recipientFamily, senderFamily)
+					)
+						continue;
+					const source = endpoint.worker.client;
+					if (!source) continue;
+					const token = randomUUID();
+					const attempt = { source, token, started: Date.now() };
+					this.nativeAttempts.set(message.requestId, attempt);
+					// Bind the attempt before the request: persistence may be reported before its response.
+					void source
+						.requestWorker(
+							{
+								type: "worker_native_mesh_deliver_message",
+								targetActiveSessionId: endpoint.summary.activeSessionId!,
+								expectedSessionId: endpoint.summary.sessionId,
+								message: message.text,
+								sender: { clientId: message.from },
+								fromRelationship: agentFamilyRelationship(recipientFamily, senderFamily),
+								requestId: message.requestId,
+								attemptToken: token,
+							},
+							30_000,
+						)
+						.then((response) => {
+							if (!response.success && this.nativeAttempts.get(message.requestId) === attempt)
+								this.nativeAttempts.delete(message.requestId);
+						})
+						.catch(() => {
+							if (this.nativeAttempts.get(message.requestId) === attempt)
+								this.nativeAttempts.delete(message.requestId);
+						});
+				}
+			}),
+		);
+	}
+
+	private async sendNativeOutbox(id: string): Promise<void> {
+		if (this.shuttingDown || !this.nativeOutbox) throw new Error("Native mesh is shutting down");
+		const send = this.nativeOutbox.send(id);
+		this.nativeOutboxSends.add(send);
+		try {
+			await send;
+		} finally {
+			this.nativeOutboxSends.delete(send);
+		}
+	}
+
+	private async confirmNativeMeshPersisted(
+		id: string,
+		attempt: { source: DaemonWorkerClient; token: string; started: number; confirming?: boolean },
+	): Promise<void> {
+		if (this.shuttingDown || this.nativeAttempts.get(id) !== attempt || !this.nativeMesh || attempt.confirming)
+			return;
+		attempt.confirming = true;
+		try {
+			await this.nativeMesh.acknowledge(id);
+		} catch {
+			/* The next poll will safely re-handoff and retry the ACK. */
+		} finally {
+			if (this.nativeAttempts.get(id) === attempt) this.nativeAttempts.delete(id);
+		}
+	}
+
+	private async sendNativeMeshMessage(
+		command: Extract<DaemonCommand, { type: "send_message" }>,
+		source: SessionSummary,
+	): Promise<DaemonResponse> {
+		const endpoint = this.nativeLocalEndpoints().find(
+			(entry) =>
+				entry.summary.sessionId === source.sessionId && entry.summary.activeSessionId === source.activeSessionId,
+		);
+		if (!endpoint || !this.nativeOutbox || !this.nativeOperations)
+			throw new Error("Message was not stored: native mesh sender is unavailable");
+		const operationId = command.nativeMeshOperationId ?? randomUUID();
+		const message = normalizeAgentSessionMessage(command.message);
+		const previous = this.nativeOperations.get(endpoint.id, operationId);
+		const target = this.nativeObservations.get(command.targetActiveSessionId);
+		if (previous) {
+			if (previous.to !== command.targetActiveSessionId || previous.text !== message)
+				throw new Error(
+					"Conflicting native mesh operation: operation_id is already bound to a different message or target",
+				);
+		} else {
+			if (
+				!target ||
+				target.hostId === this.nativeMeshConfig?.machineId ||
+				target.state !== "active" ||
+				Date.now() - Date.parse(target.lastHeartbeatAt) > 90_000
+			)
+				throw new Error("Message was not stored: native mesh target is unavailable");
+			const local = this.nativeObservations.get(endpoint.id);
+			const senderFamily = local && this.nativeFamilyEntry(local);
+			const targetFamily = this.nativeFamilyEntry(target);
+			if (!senderFamily || !targetFamily)
+				throw new Error("Message was not stored: native mesh family is unresolved");
+			assertAgentFamilyReach(senderFamily, targetFamily);
+		}
+		if (this.shuttingDown) throw new Error("Message was not stored: supervisor is shutting down");
+		// Bind source, target and content durably before creating the outbox item.
+		// Bindings survive successful sends so a later retry cannot change payload.
+		const id = this.nativeOperations.bind({
+			from: endpoint.id,
+			to: command.targetActiveSessionId,
+			text: message,
+			operationId,
+		});
+		const queued = this.nativeOutbox.enqueue({
+			from: endpoint.id,
+			to: command.targetActiveSessionId,
+			text: message,
+			callerMessageId: operationId,
+		});
+		if (queued !== id) throw new Error("Native mesh operation identity mismatch");
+		try {
+			await this.sendNativeOutbox(id);
+		} catch {
+			throw new Error(
+				`Message storage outcome is unknown (request ${id}; operation_id ${JSON.stringify(operationId)}). The supervisor will retry this exact request. To retry, use the same operation_id and identical target and message; a new operation_id may deliver it twice.`,
+			);
+		}
+		return success(command.id, command.type, {
+			id,
+			operationId,
+			source: "agent_message",
+			message,
+			target: {
+				activeSessionId: command.targetActiveSessionId,
+				sessionId: command.targetActiveSessionId,
+				...(target ? { sessionName: target.name } : {}),
+			},
+			from: { activeSessionId: source.activeSessionId ?? source.id, sessionId: source.sessionId },
+			deliveryStatus: "stored",
+		});
 	}
 
 	private async handoffMeshMessage(
@@ -6602,6 +6988,29 @@ export class DaemonSupervisor {
 		if (outboundType === "roster_heartbeat") {
 			return;
 		}
+		if (outboundType === "native_mesh_message_persisted" || outboundType === "native_mesh_message_dropped") {
+			if (this.shuttingDown || !source || source !== worker.client || !worker.nativeMeshDeliveryCapable) return;
+			try {
+				const frameData = JSON.parse(frame.payload.toString("utf8")) as {
+					type?: unknown;
+					requestId?: unknown;
+					attemptToken?: unknown;
+				};
+				if (
+					frameData.type !== outboundType ||
+					typeof frameData.requestId !== "string" ||
+					typeof frameData.attemptToken !== "string"
+				)
+					return;
+				const attempt = this.nativeAttempts.get(frameData.requestId);
+				if (!attempt || attempt.source !== source || attempt.token !== frameData.attemptToken) return;
+				if (outboundType === "native_mesh_message_dropped") this.nativeAttempts.delete(frameData.requestId);
+				else void this.confirmNativeMeshPersisted(frameData.requestId, attempt);
+			} catch {
+				this.log("Native mesh worker sent an invalid persistence frame");
+			}
+			return;
+		}
 		if (outboundType === "agent_message_persisted" || outboundType === "agent_message_dropped") {
 			if (
 				this.shuttingDown ||
@@ -8087,6 +8496,10 @@ export class DaemonSupervisor {
 
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
 		this.shuttingDown = true;
+		if (this.nativeMeshTimer) clearInterval(this.nativeMeshTimer);
+		this.nativeMeshTimer = undefined;
+		await this.nativeMeshSweep?.catch(() => undefined);
+		await Promise.allSettled([...this.nativeOutboxSends]);
 		await this.runCleanupStep("mesh endpoints", () => this.mesh?.stop());
 		this.clearIdleEvictionTimer();
 		this.clearHeartbeatsChangedBroadcast();
@@ -8191,6 +8604,10 @@ export class DaemonSupervisor {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		if (this.nativeMeshTimer) clearInterval(this.nativeMeshTimer);
+		this.nativeMeshTimer = undefined;
+		await this.nativeMeshSweep?.catch(() => undefined);
+		await Promise.allSettled([...this.nativeOutboxSends]);
 		await this.runCleanupStep("mesh endpoints", () => this.mesh?.stop());
 		this.clearIdleEvictionTimer();
 		this.clearHeartbeatsChangedBroadcast();

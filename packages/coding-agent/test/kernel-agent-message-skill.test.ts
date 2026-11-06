@@ -173,6 +173,53 @@ print(json.dumps({"has_list_agents": hasattr(agent_message, "list_agents"), "rec
 		expect(requests[1].payload).not.toHaveProperty("receiver_role");
 	});
 
+	it("validates and passes operation IDs through the host bridge", async () => {
+		const requests: Record<string, unknown>[] = [];
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAgentMessageSkill()],
+			hostHandlers: {
+				"agent_message.send": async (payload) => {
+					requests.push(payload);
+					return { deliveryStatus: "stored" };
+				},
+			},
+		});
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+await agent_message.send("legacy", receiver_role="parent")
+for _ in range(2):
+    await agent_message.send("hello", receiver_name="remote", operation_id="op-123")
+await agent_message.send("boundary", receiver_role="parent", operation_id="é" * 64)
+for value in (42, "", "   ", "x\\n", "x\\x7f", "é" * 65, "\\ud800"):
+    try:
+        await agent_message.send("bad", receiver_role="parent", operation_id=value)
+    except (TypeError, ValueError) as error:
+        print(type(error).__name__)
+    else:
+        print("unexpected success")
+try:
+    await agent_message.send("all", "bad", operation_id="op-broadcast")
+except ValueError as error:
+    print(str(error))
+`);
+		expect(result.status).toBe("ok");
+		expect(result.stdout.trim().split("\n")).toEqual([
+			"TypeError",
+			"ValueError",
+			"ValueError",
+			"ValueError",
+			"ValueError",
+			"ValueError",
+			"ValueError",
+			"operation_id cannot be used with broadcast",
+		]);
+		expect(requests).toHaveLength(4);
+		expect(requests[0]).not.toHaveProperty("operation_id");
+		expect(requests[1]).toMatchObject({ message: "hello", receiver_name: "remote", operation_id: "op-123" });
+		expect(requests[2]).toMatchObject({ message: "hello", receiver_name: "remote", operation_id: "op-123" });
+		expect(requests[3]).toMatchObject({ receiver_role: "parent", operation_id: "é".repeat(64) });
+	});
+
 	it("emits successful broadcast receipts and leaves short errors in the result", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],

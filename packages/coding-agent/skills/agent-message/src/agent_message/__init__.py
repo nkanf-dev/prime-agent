@@ -20,9 +20,26 @@ async def send(
     *,
     receiver_role: ReceiverRole | str | None = None,
     receiver_name: str | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     """Send by family role, local-space name or ID, or broadcast."""
     roles = ("parent", "sibling", "child")
+    if operation_id is not None:
+        if not isinstance(operation_id, str):
+            raise TypeError("operation_id must be str or None")
+        try:
+            encoded_operation_id = operation_id.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("operation_id must be valid UTF-8") from error
+        if (
+            not operation_id.strip()
+            or len(encoded_operation_id) > 128
+            or any(ord(char) < 32 or ord(char) == 127 for char in operation_id)
+        ):
+            raise ValueError(
+                "operation_id must be nonblank, contain no control characters, "
+                "and be at most 128 UTF-8 bytes"
+            )
     if broadcast_message is not None:
         if message != "all":
             raise TypeError(
@@ -31,6 +48,8 @@ async def send(
             )
         if receiver_role is not None or receiver_name is not None:
             raise TypeError("broadcast cannot be combined with receiver_role/receiver_name")
+        if operation_id is not None:
+            raise ValueError("operation_id cannot be used with broadcast")
         payload: dict[str, Any] = {
             "target": "all",
             "message": broadcast_message,
@@ -52,6 +71,8 @@ async def send(
         payload = {"message": message, "receiver_name": receiver_name}
         if receiver_role is not None:
             payload["receiver_role"] = receiver_role
+        if operation_id is not None:
+            payload["operation_id"] = operation_id
     receipt = await host_request("agent_message.send", payload)
     receipts = receipt.get("receipts") if isinstance(receipt, dict) else None
     if isinstance(receipts, list):

@@ -12,6 +12,8 @@ const required = [
 	"dist/mcp-services.bundled.json",
 	"dist/prime-agent-runtime/pyproject.toml",
 	"dist/skills/websearch/SKILL.md",
+	"dist/skills/envinhands-agent-messaging/SKILL.md",
+	"dist/skills/envinhands-resources/SKILL.md",
 ];
 
 validateBundledCatalogDir(join(root, "packages/coding-agent/dist"), { allowSmallFixture: true });

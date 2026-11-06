@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { stat, utimes } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +10,7 @@ import {
 	DEFAULT_RLM_EXTRA_IMPORT_NAMES,
 	DEFAULT_RLM_EXTRA_UV_ARGS,
 	ensureKernelPython,
+	getKernelVenvDir,
 	type KernelPythonSkill,
 	kernelVenvPython,
 	resolveRuntimeIdentity,
@@ -193,6 +194,16 @@ function installFakeUv(): string {
 }
 
 describe("kernel bootstrap", () => {
+	it("uses the team kernel venv by default", () => {
+		const previous = process.env.PRIME_AGENT_KERNEL_VENV;
+		delete process.env.PRIME_AGENT_KERNEL_VENV;
+		try {
+			expect(getKernelVenvDir()).toBe(join(homedir(), ".prime-team", "agent", "kernel-venv"));
+		} finally {
+			if (previous === undefined) delete process.env.PRIME_AGENT_KERNEL_VENV;
+			else process.env.PRIME_AGENT_KERNEL_VENV = previous;
+		}
+	});
 	beforeEach(async () => {
 		runtimeIdentity = await resolveRuntimeIdentity();
 		originalEnv = { ...process.env };

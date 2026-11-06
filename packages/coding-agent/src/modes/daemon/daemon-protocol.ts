@@ -532,6 +532,8 @@ export type DaemonCommand =
 			fromActiveSessionId?: string;
 			/** Internal worker-origin marker; public clients remain unrestricted. */
 			agentOrigin?: boolean;
+			/** Stable caller operation ID for safe native-mesh retries. */
+			nativeMeshOperationId?: string;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 	  }
 	// targetSessionId carries an exact ID or a directory address. IDs win over names;

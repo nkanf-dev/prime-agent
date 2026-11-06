@@ -1,14 +1,15 @@
 {
 	"name": "@earendil-works/pi-coding-agent",
 	"version": "0.9.8+fork.4",
+	"private": true,
 	"description": "Coding agent CLI with a persistent Python REPL kernel and session management",
 	"type": "module",
 	"piConfig": {
-		"name": "prime-agent",
-		"configDir": ".prime/agent"
+		"name": "prime-agent-team",
+		"configDir": ".prime-team/agent"
 	},
 	"bin": {
-		"pi": "dist/bundle/cli.js"
+		"prime-agent-team": "dist/bundle/cli.js"
 	},
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",

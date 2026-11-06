@@ -42,9 +42,19 @@ export const DAEMON_WORKER_MESH_DELIVERY_CAPABILITY = "mesh_delivery";
 
 export const DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY = "mesh_replacement";
 
+/** Private durable native-mesh handoff, not broker authentication. */
+export const DAEMON_WORKER_NATIVE_MESH_DELIVERY_CAPABILITY = "native_mesh_delivery";
+
 export type DaemonWorkerPersistenceOutbound =
 	| { type: "agent_message_persisted"; cotalId: string; attemptToken: string }
-	| { type: "agent_message_dropped"; cotalId: string; attemptToken: string; reason: "cleared" | "closed" | "other" };
+	| { type: "agent_message_dropped"; cotalId: string; attemptToken: string; reason: "cleared" | "closed" | "other" }
+	| { type: "native_mesh_message_persisted"; requestId: string; attemptToken: string }
+	| {
+			type: "native_mesh_message_dropped";
+			requestId: string;
+			attemptToken: string;
+			reason: "cleared" | "closed" | "other";
+	  };
 
 /** Idle keepalive cadence for worker->supervisor roster frames; the supervisor staleness threshold derives from it. */
 export const ROSTER_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -151,6 +161,18 @@ export type DaemonWorkerCommand =
 			fromRelationship?: AgentFamilyRelationship;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 			cotal?: { id: string; deliveryCount: number; attemptToken: string };
+	  }
+	/** Supervisor must authenticate and authorize the sender before this command. */
+	| {
+			id?: string;
+			type: "worker_native_mesh_deliver_message";
+			targetActiveSessionId: string;
+			expectedSessionId: string;
+			message: string;
+			sender: AgentSessionMessageSender;
+			fromRelationship?: AgentFamilyRelationship;
+			requestId: string;
+			attemptToken: string;
 	  }
 	| { id?: string; type: "worker_prepare_update"; checkpointTimeoutMs?: number }
 	| { id?: string; type: "worker_commit_update" }

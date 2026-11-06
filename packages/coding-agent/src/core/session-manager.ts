@@ -6,14 +6,17 @@ import {
 	appendFileSync,
 	chownSync,
 	closeSync,
+	constants,
 	existsSync,
 	fstatSync,
+	fsyncSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readFileSync,
 	readSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	writeSync,
@@ -2208,6 +2211,114 @@ export class SessionManager {
 	/** A successful append, rewrite or file load covered this entry, not merely another entry. */
 	isEntryPersisted(entryId: string): boolean {
 		return this.persistedEntryIds.has(entryId);
+	}
+
+	/**
+	 * Sync an already persisted entry for callers that must not acknowledge an
+	 * unsynced write. This does not flush buffered entries or repair a stale file.
+	 * Syncs canonical directory ancestors to the root as well as the file.
+	 * Throws if the file, entry, session identity, directory chain, or resolved
+	 * original path changed. The session file itself may not be a symlink.
+	 * Fails on platforms without no-follow/directory opens or directory fsync.
+	 * Filesystem and hardware durability semantics still apply.
+	 */
+	syncPersistedEntry(entryId: string): void {
+		const path = this.sessionFile;
+		const entry = this.byId.get(entryId);
+		const sessionId = this.sessionId;
+		const generation = this.storageGeneration;
+		if (!this.persist || !path || !entry || !this.persistedEntryIds.has(entryId) || !generation) {
+			throw new Error(`Session entry ${entryId} is not persisted`);
+		}
+		if (this.storageWriteError) throw this.storageWriteError;
+		if (constants.O_NOFOLLOW === undefined || constants.O_DIRECTORY === undefined) {
+			throw new Error("Safe session sync is not supported on this platform");
+		}
+		// Sync from the containing directory to the root. A newly-created session
+		// directory (or one of its ancestors) also needs its parent synced.
+		const directories: { path: string; fd: number }[] = [];
+		const originalDirectory = dirname(path);
+		const canonicalDirectory = realpathSync(originalDirectory);
+		let syncError: unknown;
+		let failed = false;
+		try {
+			let directory = canonicalDirectory;
+			for (;;) {
+				directories.push({
+					path: directory,
+					fd: openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW),
+				});
+				const parent = dirname(directory);
+				if (parent === directory) break;
+				directory = parent;
+			}
+			const fileFd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+			try {
+				const sameIdentity = (a: ReturnType<typeof fstatSync>, b: ReturnType<typeof fstatSync>) =>
+					a.dev === b.dev && a.ino === b.ino;
+				const fileGeneration = (st: ReturnType<typeof fstatSync>) =>
+					`${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+				const checkIdentity = () => {
+					const fileStat = fstatSync(fileFd);
+					const pathStat = lstatSync(path);
+					if (
+						realpathSync(originalDirectory) !== canonicalDirectory ||
+						!sameIdentity(fstatSync(directories[0]!.fd), statSync(originalDirectory))
+					)
+						throw new Error(`Session directory changed during sync: ${originalDirectory}`);
+					for (const directory of directories) {
+						const dirStat = fstatSync(directory.fd);
+						const dirPathStat = lstatSync(directory.path);
+						if (!dirStat.isDirectory() || !dirPathStat.isDirectory() || !sameIdentity(dirStat, dirPathStat)) {
+							throw new Error(`Session directory changed during sync: ${directory.path}`);
+						}
+					}
+					if (
+						!fileStat.isFile() ||
+						!pathStat.isFile() ||
+						!sameIdentity(fileStat, pathStat) ||
+						fileGeneration(fileStat) !== generation ||
+						this.sessionFile !== path ||
+						this.sessionId !== sessionId ||
+						this.storageGeneration !== generation ||
+						this.byId.get(entryId) !== entry ||
+						!this.persistedEntryIds.has(entryId)
+					)
+						throw new Error(`Session file changed during sync: ${path}`);
+				};
+				checkIdentity();
+				fsyncSync(fileFd);
+				for (const directory of directories) fsyncSync(directory.fd);
+				checkIdentity();
+				const stored = parseStoredSegment(readFileSync(fileFd));
+				const storedEntry = stored.find((item) => item.type !== "session" && item.id === entryId);
+				if (
+					stored[0]?.id !== sessionId ||
+					!storedEntry ||
+					!isDeepStrictEqual(storedEntry, JSON.parse(JSON.stringify(entry)))
+				) {
+					throw new Error(`Session entry ${entryId} does not match persisted file`);
+				}
+				checkIdentity();
+			} finally {
+				closeSync(fileFd);
+			}
+		} catch (error) {
+			failed = true;
+			syncError = error;
+		} finally {
+			for (const directory of directories.reverse()) {
+				try {
+					closeSync(directory.fd);
+				} catch (error) {
+					if (!failed) {
+						failed = true;
+						syncError = error;
+					}
+				}
+			}
+		}
+		if (failed) throw syncError;
 	}
 
 	getCwd(): string {

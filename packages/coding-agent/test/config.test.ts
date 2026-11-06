@@ -267,7 +267,7 @@ describe("detectInstallMethod", () => {
 
 describe("session paths", () => {
 	test("prefers the app-prefixed session dir env var over the legacy one and expands tilde", () => {
-		expect(ENV_SESSION_DIR).toBe("PRIME_AGENT_SESSION_DIR");
+		expect(ENV_SESSION_DIR).toBe("PRIME_AGENT_TEAM_SESSION_DIR");
 
 		const sessionRoot = join(tmpdir(), `pi-session-root-${Date.now()}`);
 		process.env[ENV_SESSION_DIR] = sessionRoot;

@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
 import {
 	createDaemonStateRootMatcher,
@@ -115,20 +116,39 @@ describe.runIf(process.platform !== "win32")("daemon state root scoping", () => 
 		expect(belongsToStateRoot(join(base, "stranger.sock"))).toBe(false);
 	});
 
+	it("isolates the team agent dir from the mainline environment", () => {
+		const previousTeam = process.env[ENV_AGENT_DIR];
+		const previousMain = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		const base = mkdtempSync(join(tmpdir(), "state-root-brand-"));
+		cleanupDirs.push(base);
+		try {
+			process.env.PRIME_AGENT_CODING_AGENT_DIR = join(base, "main");
+			delete process.env[ENV_AGENT_DIR];
+			expect(currentDaemonStateRoot().agentDir).not.toBe(join(base, "main"));
+			process.env[ENV_AGENT_DIR] = join(base, "team");
+			expect(currentDaemonStateRoot().agentDir).toBe(join(base, "team"));
+		} finally {
+			if (previousTeam === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = previousTeam;
+			if (previousMain === undefined) delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			else process.env.PRIME_AGENT_CODING_AGENT_DIR = previousMain;
+		}
+	});
+
 	it("follows the environment instead of a value captured at import time", () => {
-		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		const previousAgentDir = process.env[ENV_AGENT_DIR];
 		const base = mkdtempSync(join(tmpdir(), "state-root-env-"));
 		cleanupDirs.push(base);
-		process.env.PRIME_AGENT_CODING_AGENT_DIR = join(base, "agent");
+		process.env[ENV_AGENT_DIR] = join(base, "agent");
 		try {
 			const root = currentDaemonStateRoot();
 			expect(root.agentDir).toBe(join(base, "agent"));
 			expect(root.socketDir).toBe(defaultDaemonSocketDir());
 		} finally {
 			if (previousAgentDir === undefined) {
-				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+				delete process.env[ENV_AGENT_DIR];
 			} else {
-				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+				process.env[ENV_AGENT_DIR] = previousAgentDir;
 			}
 		}
 	});

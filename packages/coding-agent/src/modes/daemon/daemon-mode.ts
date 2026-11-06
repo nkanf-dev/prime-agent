@@ -33,6 +33,7 @@ import {
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
+	type AgentSessionMessageDetails,
 	type AgentSessionMessageEndpoint,
 	type AgentSessionMessageListResult,
 	type AgentSessionMessagePayload,
@@ -229,6 +230,7 @@ import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
 	DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
+	DAEMON_WORKER_NATIVE_MESH_DELIVERY_CAPABILITY,
 	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
@@ -518,6 +520,7 @@ export class AgentDaemon {
 	private readonly sameIdReplacements = new WeakSet<AgentSession>();
 	private readonly unsafeMeshSessions = new WeakSet<AgentSession>();
 	private readonly meshMessageIds = new WeakMap<AgentSession, Set<string>>();
+	private readonly nativeMeshFingerprints = new WeakMap<AgentSession, Map<string, string>>();
 	private readonly meshAdmissions = new WeakMap<
 		AgentSession,
 		Map<string, Promise<{ status: AgentSessionMessageDeliveryStatus }>>
@@ -3499,6 +3502,7 @@ export class AgentDaemon {
 					message: input.message,
 					targetKind: input.targetKind,
 					receiverRole: input.receiverRole,
+					operationId: input.operationId,
 					fromState: requireCurrentState(),
 					origin: "agent",
 				}),
@@ -3931,6 +3935,7 @@ export class AgentDaemon {
 						capabilities: [
 							DAEMON_WORKER_ROSTER_CAPABILITY,
 							DAEMON_WORKER_MESH_DELIVERY_CAPABILITY,
+							DAEMON_WORKER_NATIVE_MESH_DELIVERY_CAPABILITY,
 							DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 							...(this.options.worker.workerInstanceId !== undefined
 								? [DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY]
@@ -4167,6 +4172,10 @@ export class AgentDaemon {
 				case "worker_passivate_idle_children": {
 					const count = await this.passivateIdleChildren(command.idleEvictionMinutes, command.now, command.limit);
 					this.writeWorkerSuccess(client, command, { count });
+					return;
+				}
+				case "worker_native_mesh_deliver_message": {
+					await this.receiveMeshMessage(client, command);
 					return;
 				}
 				case "worker_deliver_message": {
@@ -6366,6 +6375,7 @@ export class AgentDaemon {
 		message: string;
 		targetKind?: "name";
 		receiverRole?: AgentFamilyRelationship;
+		operationId?: string;
 		fromState?: ActiveSessionState;
 		sender?: AgentSessionMessageSender;
 		clientId?: string;
@@ -6378,6 +6388,9 @@ export class AgentDaemon {
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
 		if (this.agentMessageTransport === "cotal") {
+			if (options.operationId !== undefined) {
+				throw new Error("operation_id is only supported for remote native mesh messages");
+			}
 			if (!options.fromState) throw new Error("Message was not stored: sender has no session endpoint");
 			return this.sendMeshMessage(
 				options.fromState,
@@ -6424,13 +6437,23 @@ export class AgentDaemon {
 						} else if (this.options.worker && options.fromState) {
 							// The supervisor can resolve and wake a saved worker even when it is no longer
 							// present in this worker's resident peer snapshot.
-							return this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message);
+							return options.operationId === undefined
+								? this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message)
+								: this.sendRemoteAgentSessionMessage(
+										options.fromState,
+										targetSelector,
+										message,
+										options.operationId,
+									);
 						} else {
 							throw error;
 						}
 					}
 				}
 			}
+		}
+		if (options.operationId !== undefined) {
+			throw new Error("operation_id is only supported for remote native mesh messages");
 		}
 		if (options.fromState?.activeSessionId === targetState.activeSessionId) {
 			throw new Error("Agent messaging cannot target the sending session");
@@ -6650,15 +6673,28 @@ export class AgentDaemon {
 
 	private async receiveMeshMessage(
 		client: DaemonSocketClient,
-		command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" }>,
+		command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" | "worker_native_mesh_deliver_message" }>,
 	): Promise<void> {
-		if (
+		const native = command.type === "worker_native_mesh_deliver_message";
+		if (native) {
+			if (
+				this.agentMessageTransport !== "native" ||
+				!/^nm1m-[a-f0-9]{64}$/.test(command.requestId) ||
+				typeof command.attemptToken !== "string" ||
+				!command.attemptToken ||
+				typeof command.expectedSessionId !== "string" ||
+				!command.expectedSessionId
+			)
+				throw new Error("Invalid native mesh delivery");
+		} else if (
 			this.agentMessageTransport !== "cotal" ||
 			!command.cotal ||
 			typeof command.cotal.attemptToken !== "string" ||
 			!command.cotal.attemptToken
 		)
 			throw new Error("Mesh delivery requires the authenticated Cotal transport mode");
+		const meshId = native ? command.requestId : command.cotal!.id;
+		const attemptToken = native ? command.attemptToken : command.cotal!.attemptToken;
 		let target: ActiveSessionState;
 		try {
 			target = await this.getOrHydrateBoundSessionState(command.targetActiveSessionId);
@@ -6668,6 +6704,8 @@ export class AgentDaemon {
 			target = await this.hydratePassiveRlmSubagent(passive);
 		}
 		const recipientSession = target.runtime.session;
+		if (native && recipientSession.sessionId !== command.expectedSessionId)
+			throw new Error("Native mesh target session changed");
 		if (this.unsafeMeshSessions.has(recipientSession))
 			throw new Error("Mesh session must be reopened from disk after replacement failure");
 		const manager = recipientSession.sessionManager;
@@ -6687,13 +6725,13 @@ export class AgentDaemon {
 			}
 		}
 		const payload: AgentSessionMessagePayload = {
-			id: `${AGENT_MESSAGE_ID_PREFIX}${command.cotal.id}`,
+			id: `${AGENT_MESSAGE_ID_PREFIX}${native ? `native-mesh:${meshId}` : meshId}`,
 			source: AGENT_MESSAGE_SOURCE,
 			message: normalizeAgentSessionMessage(command.message),
 			from: command.sender,
 			fromRelationship: command.fromRelationship,
 			target: this.createAgentSessionMessageEndpoint(target),
-			possiblyRepeated: command.cotal.deliveryCount > 1,
+			possiblyRepeated: native ? true : command.cotal!.deliveryCount > 1,
 		};
 		const ownEntry = (id = payload.id) =>
 			manager
@@ -6707,19 +6745,54 @@ export class AgentDaemon {
 						"id" in entry.details &&
 						entry.details.id === id,
 				);
+		// A broker request ID must never silently alias different contents, including
+		// while the first attempt is queued or waiting for admission.
+		const fingerprint = (
+			message: string,
+			from: AgentSessionMessageSender | undefined,
+			relationship: AgentFamilyRelationship | undefined,
+		) =>
+			JSON.stringify([
+				message,
+				from?.activeSessionId,
+				from?.sessionId,
+				from?.sessionName,
+				from?.runtimeKind,
+				from?.clientId,
+				relationship,
+			]);
+		let nativeFingerprints: Map<string, string> | undefined;
+		if (native) {
+			nativeFingerprints = this.nativeMeshFingerprints.get(recipientSession) ?? new Map();
+			this.nativeMeshFingerprints.set(recipientSession, nativeFingerprints);
+			const expected = fingerprint(payload.message, payload.from, payload.fromRelationship);
+			const entry = ownEntry();
+			const details =
+				entry?.type === "custom_message" ? (entry.details as AgentSessionMessageDetails | undefined) : undefined;
+			if (
+				(nativeFingerprints.has(payload.id) && nativeFingerprints.get(payload.id) !== expected) ||
+				(details && fingerprint(details.message, details.from, details.fromRelationship) !== expected)
+			)
+				throw new Error("Native mesh request ID conflicts with existing delivery");
+			nativeFingerprints.set(payload.id, expected);
+		}
 		const messageIds = this.meshMessageIds.get(recipientSession) ?? new Set<string>();
 		if (!this.meshMessageIds.has(recipientSession)) {
 			this.meshMessageIds.set(recipientSession, messageIds);
 			const stopTracking = manager.onPersist(() => {
 				for (const id of messageIds) {
 					const entry = ownEntry(id);
-					if (entry && manager.isEntryPersisted(entry.id)) messageIds.delete(id);
+					if (entry && manager.isEntryPersisted(entry.id)) {
+						messageIds.delete(id);
+						this.nativeMeshFingerprints.get(recipientSession)?.delete(id);
+					}
 				}
 			});
 			recipientSession.registerDisposeCallback(() => {
 				stopTracking();
 				messageIds.clear();
 				this.meshMessageIds.delete(recipientSession);
+				this.nativeMeshFingerprints.delete(recipientSession);
 			});
 		}
 		const existing = ownEntry();
@@ -6738,29 +6811,47 @@ export class AgentDaemon {
 		};
 		const check = () => {
 			if (!accepted || sent || !active || this.unsafeMeshSessions.has(recipientSession)) return;
+			if (
+				native &&
+				(target.runtime.session !== recipientSession || recipientSession.sessionId !== command.expectedSessionId)
+			)
+				return;
 			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
 				cleanup();
 				return;
 			}
 			const entry = ownEntry();
 			if (!entry || !manager.isEntryPersisted(entry.id)) return;
+			if (native) {
+				try {
+					// File and parent directory must be durable before the supervisor ACKs.
+					manager.syncPersistedEntry(entry.id);
+				} catch {
+					// Keep the broker message pending. A later handoff retries the sync.
+					this.log("Native mesh entry sync failed; retaining broker message for retry");
+					cleanup();
+					return;
+				}
+				this.nativeMeshFingerprints.get(recipientSession)?.delete(payload.id);
+			}
 			sent = true;
 			cleanup();
 			client.socket.write(
 				encodePrivateFrame<DaemonWorkerFrameHeader>(
-					{ kind: "outbound", outboundType: "agent_message_persisted" },
+					{ kind: "outbound", outboundType: native ? "native_mesh_message_persisted" : "agent_message_persisted" },
 					Buffer.from(
-						serializeJsonLine({
-							type: "agent_message_persisted",
-							cotalId: command.cotal!.id,
-							attemptToken: command.cotal!.attemptToken,
-						}),
+						serializeJsonLine(
+							native
+								? { type: "native_mesh_message_persisted", requestId: meshId, attemptToken }
+								: { type: "agent_message_persisted", cotalId: meshId, attemptToken },
+						),
 					),
 				),
 			);
 		};
 		const dropped = (error: unknown) => {
 			messageIds.delete(payload.id);
+			this.nativeMeshFingerprints.get(recipientSession)?.delete(payload.id);
 			deliveryFailure = error;
 			check();
 			const reason = this.unsafeMeshSessions.has(recipientSession)
@@ -6779,14 +6870,13 @@ export class AgentDaemon {
 			cleanup();
 			client.socket.write(
 				encodePrivateFrame<DaemonWorkerFrameHeader>(
-					{ kind: "outbound", outboundType: "agent_message_dropped" },
+					{ kind: "outbound", outboundType: native ? "native_mesh_message_dropped" : "agent_message_dropped" },
 					Buffer.from(
-						serializeJsonLine({
-							type: "agent_message_dropped",
-							cotalId: command.cotal!.id,
-							attemptToken: command.cotal!.attemptToken,
-							reason,
-						}),
+						serializeJsonLine(
+							native
+								? { type: "native_mesh_message_dropped", requestId: meshId, attemptToken, reason }
+								: { type: "agent_message_dropped", cotalId: meshId, attemptToken, reason },
+						),
 					),
 				),
 			);
@@ -6841,10 +6931,20 @@ export class AgentDaemon {
 		fromState: ActiveSessionState,
 		targetSelector: string,
 		message: string,
+		callerOperationId?: string,
 	): Promise<AgentSessionMessageReceipt> {
+		const nativeRemote = /^nm1-[a-f0-9]{64}$/.test(targetSelector);
+		if (!nativeRemote && callerOperationId !== undefined) {
+			throw new Error("operation_id is only supported for remote native mesh messages");
+		}
+		const operationId = nativeRemote ? (callerOperationId ?? randomUUID()) : undefined;
 		const link = this.supervisorLink();
 		if (!link) {
-			throw new Error(`Unknown active session: ${targetSelector}`);
+			throw new Error(
+				operationId === undefined
+					? `Unknown active session: ${targetSelector}`
+					: `Unknown active session: ${targetSelector}. operationId=${JSON.stringify(operationId)}; retry with the SAME operation_id only`,
+			);
 		}
 		const deadline = Date.now() + 30_000;
 		let lastError: unknown;
@@ -6862,25 +6962,51 @@ export class AgentDaemon {
 			}
 		}
 		if (lastError !== undefined) {
-			throw lastError instanceof Error ? lastError : new Error(`Unknown active session: ${targetSelector}`);
+			if (operationId === undefined) {
+				throw lastError instanceof Error ? lastError : new Error(`Unknown active session: ${targetSelector}`);
+			}
+			const detail = lastError instanceof Error ? lastError.message : String(lastError);
+			throw new Error(
+				`Supervisor connection failed: ${detail}. operationId=${JSON.stringify(operationId)}; retry with the SAME operation_id only`,
+			);
 		}
-		const response = await link.request(
-			{
-				type: "send_message",
-				targetActiveSessionId: targetSelector,
-				message,
-				fromActiveSessionId: fromState.activeSessionId,
-				agentOrigin: true,
-			},
-			30_000,
-		);
+		let response: Awaited<ReturnType<typeof link.request>>;
+		try {
+			response = await link.request(
+				{
+					type: "send_message",
+					targetActiveSessionId: targetSelector,
+					message,
+					fromActiveSessionId: fromState.activeSessionId,
+					agentOrigin: true,
+					...(operationId === undefined ? {} : { nativeMeshOperationId: operationId }),
+				},
+				30_000,
+			);
+		} catch (error) {
+			if (operationId === undefined) throw error;
+			const detail = error instanceof Error ? error.message : String(error);
+			throw new Error(
+				`Supervisor send outcome is unknown: ${detail}. operationId=${JSON.stringify(operationId)}; retry with the SAME operation_id only`,
+			);
+		}
 		if (!response.success) {
-			throw deserializeDaemonError(response);
+			const error = deserializeDaemonError(response);
+			if (operationId === undefined) throw error;
+			throw new Error(
+				`${error.message}. operationId=${JSON.stringify(operationId)}; retry with the SAME operation_id only`,
+			);
 		}
 		if (!response.data || typeof response.data !== "object") {
-			throw new Error("Supervisor returned an invalid agent-message receipt");
+			throw new Error(
+				operationId === undefined
+					? "Supervisor returned an invalid agent-message receipt"
+					: `Supervisor returned an invalid agent-message receipt. operationId=${JSON.stringify(operationId)}; retry with the SAME operation_id only`,
+			);
 		}
-		return response.data as AgentSessionMessageReceipt;
+		return operationId === undefined
+			? (response.data as AgentSessionMessageReceipt)
+			: { ...(response.data as AgentSessionMessageReceipt), operationId };
 	}
 
 	private async acceptAgentSessionMessage(

@@ -151,6 +151,8 @@ export interface AgentSessionMessageReceipt {
 	target: AgentSessionMessageEndpoint;
 	from?: AgentSessionMessageSender;
 	message: string;
+	/** Stable caller operation ID for remote native mesh sends. */
+	operationId?: string;
 	// Not named "status": the kernel host bridge envelope reserves that key.
 	deliveryStatus: AgentSessionMessageDeliveryStatus;
 	/** Broker storage proof, not recipient delivery proof. Present only for stored mesh messages. */
@@ -168,6 +170,7 @@ export interface AgentSessionMessageSendInput {
 	message: string;
 	receiverRole?: AgentFamilyRelationship;
 	targetKind?: "name";
+	operationId?: string;
 }
 
 export interface AgentSessionMessageController {
@@ -561,12 +564,27 @@ export function createAgentMessageHostHandlers(
 			if (typeof payload.message !== "string") {
 				throw new Error("agent_message.send message must be a string");
 			}
+			const operationId = payload.operation_id;
+			if (
+				operationId !== undefined &&
+				(typeof operationId !== "string" ||
+					!operationId.trim() ||
+					/[\u0000-\u001f\u007f]/.test(operationId) ||
+					Buffer.byteLength(operationId, "utf8") > 128)
+			) {
+				throw new Error(
+					"agent_message.send operation_id must be a nonblank string without control characters of at most 128 UTF-8 bytes",
+				);
+			}
 			let target: string;
 			if (typeof payload.target === "string") {
 				if (payload.target !== "all") {
 					throw new Error(
 						"positional agent_message.send targets are not supported; use receiver_role and receiver_name",
 					);
+				}
+				if (operationId !== undefined) {
+					throw new Error("agent_message.send operation_id cannot be used with broadcast");
 				}
 				if (payload.receiver_role !== undefined || payload.receiver_name !== undefined) {
 					throw new Error("agent_message.send broadcast cannot be combined with receiver_role/receiver_name");
@@ -598,6 +616,7 @@ export function createAgentMessageHostHandlers(
 					target: payload.receiver_name.trim(),
 					message: payload.message,
 					targetKind: "name",
+					...(operationId !== undefined ? { operationId } : {}),
 				})) as unknown as Record<string, unknown>;
 			} else {
 				const role = payload.receiver_role;
@@ -637,6 +656,7 @@ export function createAgentMessageHostHandlers(
 				target,
 				message: payload.message,
 				receiverRole: payload.receiver_role as AgentFamilyRelationship,
+				...(operationId !== undefined ? { operationId } : {}),
 			})) as unknown as Record<string, unknown>;
 		},
 	};

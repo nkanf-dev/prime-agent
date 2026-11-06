@@ -10,6 +10,7 @@ import {
 	repositoryRootForSocket,
 	repositorySocketPath,
 } from "../src/cli/repository-daemon.js";
+import { ENV_SESSION_DIR } from "../src/config.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
 import * as childProcess from "../src/utils/child-process.js";
@@ -22,7 +23,7 @@ it.each([
 	"symlink",
 	"worktree",
 	"submodule",
-	".prime",
+	".prime-team",
 	"outside",
 	"bare",
 	"missing",
@@ -66,22 +67,22 @@ it.each([
 			fs.symlinkSync(root, folder, "dir");
 		}
 		if (kind === "git-dir") folder = join(root, ".git");
-		const session = join(root, kind === ".prime" ? "agent/sessions" : ".prime/agent/sessions");
+		const session = join(root, kind === ".prime-team" ? "agent/sessions" : ".prime-team/agent/sessions");
 		const exclude =
 			kind === "submodule" ? git(root, "rev-parse", "--git-path", "info/exclude") : join(root, ".git/info/exclude");
-		if (kind === "ignored") fs.writeFileSync(join(root, ".gitignore"), ".prime/\n");
-		if (kind === "contents") fs.writeFileSync(join(root, ".gitignore"), ".prime/agent/sessions/*\n");
-		if (kind === "negated") fs.writeFileSync(join(root, ".gitignore"), "!.prime/agent/sessions/\n");
+		if (kind === "ignored") fs.writeFileSync(join(root, ".gitignore"), ".prime-team/\n");
+		if (kind === "contents") fs.writeFileSync(join(root, ".gitignore"), ".prime-team/agent/sessions/*\n");
+		if (kind === "negated") fs.writeFileSync(join(root, ".gitignore"), "!.prime-team/agent/sessions/\n");
 		if (kind === "unwritable") fs.chmodSync(exclude, 0o444);
 		if (kind === "missing") process.env.PATH = join(temp, "no-git");
 		if (kind === "env")
-			Object.assign(process.env, { GIT_DIR: join(temp, "bad"), GIT_WORK_TREE: temp, PRIME_AGENT_SESSION_DIR: temp });
+			Object.assign(process.env, { GIT_DIR: join(temp, "bad"), GIT_WORK_TREE: temp, [ENV_SESSION_DIR]: temp });
 		const before = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
 		const route = repositoryDaemon(folder);
 		if (["outside", "bare", "missing", "git-dir"].includes(kind)) expect(route).toBeUndefined();
 		else {
 			expect(route).toMatchObject({ root, sessionDir: session });
-			expect(process.env.PRIME_AGENT_SESSION_DIR).toBe(session);
+			expect(process.env[ENV_SESSION_DIR]).toBe(session);
 			expect(repositoryDaemonRoot(route!.socketPath)).toBe(root);
 			expect(fs.existsSync(session) && fs.existsSync(join(dirname(session), "session-artifacts"))).toBe(true);
 			const sum = cp.execFileSync("cksum", { input: root, encoding: "utf8" }).split(" ")[0];
@@ -89,8 +90,8 @@ it.each([
 			expect(Buffer.byteLength(route!.socketPath)).toBeLessThanOrEqual(103);
 			if (kind === ".name with spaces") expect(basename(route!.socketPath)).toContain("name_with_spaces-");
 			const content = fs.readFileSync(exclude, "utf8");
-			const base = kind === ".prime" ? "agent" : ".prime/agent";
-			const block = `\n# Prime Agent repository sessions\n/${base}/sessions/\n/${base}/session-artifacts/\n`;
+			const base = kind === ".prime-team" ? "agent" : ".prime-team/agent";
+			const block = `\n# Prime Agent Team repository sessions\n/${base}/sessions/\n/${base}/session-artifacts/\n`;
 			expect(content).toBe(["ignored", "unwritable"].includes(kind) ? before : before + block);
 			expect(warning).toHaveBeenCalledTimes(
 				["negated", "unwritable"].includes(kind) ? (kind === "unwritable" ? 2 : 1) : 0,
