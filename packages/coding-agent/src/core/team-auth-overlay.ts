@@ -1,5 +1,5 @@
 /** Read-only upstream credential lookup for the default Team configuration. */
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import type { AuthCredential } from "./auth-storage.js";
 
@@ -20,20 +20,62 @@ function hasExpectedOwner(uid: number): boolean {
 	return process.platform === "win32" || typeof process.getuid !== "function" || uid === process.getuid();
 }
 
+// Resolve links before opening, but never follow a link at the final open. An
+// existing broken link is a safe-read error, not an absent optional config.
+function resolveExisting(path: string): string {
+	lstatSync(path); // A missing entry means the optional upstream file is absent.
+	try {
+		return realpathSync(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ReadRace();
+		throw error;
+	}
+}
+
+function lstatResolved(path: string): Stats {
+	try {
+		return lstatSync(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ReadRace();
+		throw error;
+	}
+}
+
+function rejectTeamAlias(upstream: string, team: string): void {
+	try {
+		const resolved = realpathSync(team);
+		const normalize = (path: string) => (process.platform === "win32" ? path.toLowerCase() : path);
+		if (normalize(upstream) === normalize(resolved)) throw new Error("upstream aliases Team");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
 function readData(home: string): Record<string, unknown> | undefined {
 	let missing = false;
 	for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
 		try {
+			let upstreamAgent = "";
 			for (const path of [join(home, ".prime"), join(home, ".prime", "agent")]) {
-				const stat = lstatSync(path);
+				const resolved = resolveExisting(path);
+				upstreamAgent = resolved;
+				const stat = lstatResolved(resolved);
 				if (!stat.isDirectory() || stat.isSymbolicLink() || !hasExpectedOwner(stat.uid))
 					throw new Error("unsafe directory");
 			}
-			const path = join(home, ".prime", "agent", "auth.json");
-			const stat = lstatSync(path);
+			rejectTeamAlias(upstreamAgent, join(home, ".prime-team", "agent"));
+			const path = resolveExisting(join(home, ".prime", "agent", "auth.json"));
+			rejectTeamAlias(path, join(home, ".prime-team", "agent", "auth.json"));
+			const stat = lstatResolved(path);
 			if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || !hasExpectedOwner(stat.uid))
 				throw new Error("unsafe file");
-			const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+			let fd: number;
+			try {
+				fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ReadRace();
+				throw error;
+			}
 			try {
 				const opened = fstatSync(fd);
 				// An atomic replacement can unlink the old inode between lstat and open.

@@ -95,28 +95,80 @@ describe("Team configuration bootstrap", () => {
 		});
 		expect(result.status, result.stderr).toBe(0);
 	});
-	test("malformed source fails before target creation without disclosing contents", () => {
+	test("malformed source emits a safe diagnostic and does not block startup", () => {
 		const dir = home();
 		upstream(dir, "settings.json", "SECRET-INVALID-");
-		expect(() => bootstrapTeamConfig(dir)).toThrow(/settings.json/);
+		const warning = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			expect(() => bootstrapTeamConfig(dir)).not.toThrow();
+			expect(warning.mock.calls.flat().join(" ")).toContain("settings.json");
+			expect(warning.mock.calls.flat().join(" ")).not.toContain("SECRET-INVALID");
+			expect(existsSync(join(dir, ".prime-team", "agent", "settings.json"))).toBe(false);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+	// test-policy: allow conditional-or-disabled-test -- Windows file symlinks require developer mode; Linux CI exercises these checks.
+	test.skipIf(process.platform === "win32")("follows upstream directory and file links but rejects Team links", () => {
+		const dir = home();
+		const upstreamRoot = join(dir, "actual-prime");
+		const upstreamAgent = join(dir, "actual-agent");
+		mkdirSync(upstreamRoot);
+		mkdirSync(upstreamAgent);
+		writeFileSync(join(dir, "actual-settings"), '{"defaultModel":"linked"}');
+		symlinkSync(join(dir, "actual-settings"), join(upstreamAgent, "settings.json"));
+		symlinkSync(upstreamAgent, join(upstreamRoot, "agent"), "junction");
+		symlinkSync(upstreamRoot, join(dir, ".prime"), "junction");
+		bootstrapTeamConfig(dir);
+		const target = join(dir, ".prime-team", "agent");
+		expect(readFileSync(join(target, "settings.json"), "utf8")).toBe('{"defaultModel":"linked"}');
+		expect(readFileSync(join(dir, "actual-settings"), "utf8")).toBe('{"defaultModel":"linked"}');
+		rmSync(target, { recursive: true });
+		symlinkSync(upstreamAgent, target, "junction");
+		expect(() => bootstrapTeamConfig(dir)).toThrow(/unsafe/);
+	});
+	test("upstream directory junction is supported", () => {
+		const dir = home();
+		const actual = join(dir, "actual-prime");
+		mkdirSync(join(actual, "agent"), { recursive: true });
+		writeFileSync(join(actual, "agent", "settings.json"), "{}");
+		symlinkSync(actual, join(dir, ".prime"), "junction");
+		bootstrapTeamConfig(dir);
+		expect(readFileSync(join(dir, ".prime-team", "agent", "settings.json"), "utf8")).toBe("{}");
+	});
+	// test-policy: allow conditional-or-disabled-test -- Windows file symlinks require developer mode; Linux CI exercises these checks.
+	test.skipIf(process.platform === "win32")("broken upstream links warn without blocking startup", () => {
+		const warning = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const first = home();
+			symlinkSync(join(first, "missing"), join(first, ".prime"));
+			expect(() => bootstrapTeamConfig(first)).not.toThrow();
+			expect(warning.mock.calls.flat().join(" ")).toContain("upstream configuration directory");
+			const second = home();
+			mkdirSync(join(second, ".prime", "agent"), { recursive: true });
+			symlinkSync(join(second, "missing"), join(second, ".prime", "agent", "settings.json"));
+			expect(() => bootstrapTeamConfig(second)).not.toThrow();
+			expect(warning.mock.calls.flat().join(" ")).toContain("settings.json");
+			expect(existsSync(join(second, ".prime-team", "agent", "settings.json"))).toBe(false);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+	test("does not import when upstream aliases Team directory", () => {
+		const dir = home();
+		const target = join(dir, ".prime-team", "agent");
+		mkdirSync(target, { recursive: true });
+		writeFileSync(join(target, "settings.json"), '{"team":true}');
+		symlinkSync(join(dir, ".prime-team"), join(dir, ".prime"), "junction");
+		const warning = vi.spyOn(console, "error").mockImplementation(() => {});
 		try {
 			bootstrapTeamConfig(dir);
-		} catch (error) {
-			expect(String(error)).not.toContain("SECRET-INVALID");
+			expect(warning.mock.calls.flat().join(" ")).toContain("overlap");
+			expect(readFileSync(join(target, "settings.json"), "utf8")).toBe('{"team":true}');
+			expect(existsSync(join(dir, ".prime-team", ".team-bootstrap-incomplete"))).toBe(false);
+		} finally {
+			warning.mockRestore();
 		}
-		expect(existsSync(join(dir, ".prime-team", "agent", "auth.json"))).toBe(false);
-	});
-	// test-policy: allow conditional-or-disabled-test -- Windows symlink creation requires developer mode or elevated privilege; Linux CI exercises these checks.
-	test.skipIf(process.platform === "win32")("refuses source and target symlinks", () => {
-		const dir = home();
-		upstream(dir, "settings.json", "{}");
-		const src = join(dir, ".prime", "agent", "models.json");
-		symlinkSync(join(dir, ".prime", "agent", "settings.json"), src);
-		expect(() => bootstrapTeamConfig(dir)).toThrow();
-		rmSync(src);
-		rmSync(join(dir, ".prime-team", "agent"), { recursive: true });
-		symlinkSync(join(dir, ".prime", "agent"), join(dir, ".prime-team", "agent"));
-		expect(() => bootstrapTeamConfig(dir)).toThrow();
 	});
 	test("existing Team files are preserved and empty auth has safe recovery", () => {
 		const dir = home();
@@ -167,7 +219,14 @@ describe("Team configuration bootstrap", () => {
 		upstream(dir, "settings.json", "{}");
 		const src = join(dir, ".prime", "agent", "settings.json");
 		linkSync(src, join(dir, "source-hardlink"));
-		expect(() => bootstrapTeamConfig(dir)).toThrow();
+		const warning = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			expect(() => bootstrapTeamConfig(dir)).not.toThrow();
+			expect(warning.mock.calls.flat().join(" ")).toContain("settings.json");
+			expect(existsSync(join(dir, ".prime-team", "agent", "settings.json"))).toBe(false);
+		} finally {
+			warning.mockRestore();
+		}
 		rmSync(join(dir, "source-hardlink"));
 		bootstrapTeamConfig(dir);
 		const dest = join(dir, ".prime-team", "agent", "auth.json");

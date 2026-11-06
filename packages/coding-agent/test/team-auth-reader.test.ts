@@ -90,17 +90,66 @@ test.skipIf(process.platform === "win32" || typeof process.getuid !== "function"
 	},
 );
 
-// test-policy: allow conditional-or-disabled-test -- Windows may require elevation for symlink creation.
-test.skipIf(process.platform === "win32")("rejects symlinked files and directories", () => {
+test("accepts upstream directory links and junctions without changing their targets", () => {
+	for (const level of ["prime", "agent"]) {
+		const { home, path } = fixture();
+		const source = JSON.stringify({ model: { type: "api_key", key: "FAKE_LINKED_KEY" } });
+		const external = join(home, "external");
+		mkdirSync(external);
+		if (level === "prime") {
+			rmSync(join(home, ".prime"), { recursive: true });
+			mkdirSync(join(external, "agent"));
+			writeFileSync(join(external, "agent", "auth.json"), source);
+			symlinkSync(external, join(home, ".prime"), "junction");
+		} else {
+			rmSync(join(home, ".prime", "agent"), { recursive: true });
+			writeFileSync(join(external, "auth.json"), source);
+			symlinkSync(external, join(home, ".prime", "agent"), "junction");
+		}
+		expect(readUpstreamCredential(home, "model")).toEqual({ type: "api_key", key: "FAKE_LINKED_KEY" });
+		expect(readFileSync(path, "utf8")).toBe(source);
+	}
+});
+
+// test-policy: allow conditional-or-disabled-test -- Windows file symlinks can require elevation.
+test.skipIf(process.platform === "win32")("accepts an upstream auth file symlink and rejects broken links", () => {
 	const { home, path } = fixture();
 	const other = join(home, "other");
-	writeFileSync(other, "{}");
+	const source = JSON.stringify({ model: { type: "api_key", key: "FAKE_LINKED_KEY" } });
+	writeFileSync(other, source);
 	symlinkSync(other, path);
+	expect(readUpstreamCredential(home, "model")).toEqual({ type: "api_key", key: "FAKE_LINKED_KEY" });
+	expect(readFileSync(other, "utf8")).toBe(source);
+	rmSync(other);
 	expect(() => readUpstreamCredential(home, "model")).toThrow(/cannot safely read upstream/);
 	rmSync(path);
 	rmSync(join(home, ".prime", "agent"), { recursive: true });
-	symlinkSync(home, join(home, ".prime", "agent"));
+	symlinkSync(join(home, "missing"), join(home, ".prime", "agent"));
 	expect(() => listUpstreamCredentials(home)).toThrow(/cannot safely read upstream/);
+	rmSync(join(home, ".prime", "agent"));
+	rmSync(join(home, ".prime"), { recursive: true });
+	symlinkSync(join(home, "missing"), join(home, ".prime"));
+	expect(() => listUpstreamCredentials(home)).toThrow(/cannot safely read upstream/);
+});
+
+test("rejects an upstream agent directory that aliases the Team directory", () => {
+	const { home } = fixture();
+	const team = join(home, ".prime-team", "agent");
+	mkdirSync(team, { recursive: true });
+	writeFileSync(join(team, "auth.json"), JSON.stringify({ model: { type: "api_key", key: "TEAM_ONLY" } }));
+	rmSync(join(home, ".prime", "agent"), { recursive: true });
+	symlinkSync(team, join(home, ".prime", "agent"), "junction");
+	expect(() => readUpstreamCredential(home, "model")).toThrow(/cannot safely read upstream/);
+});
+
+// test-policy: allow conditional-or-disabled-test -- Windows file symlinks can require elevation.
+test.skipIf(process.platform === "win32")("rejects an upstream auth file that aliases Team auth", () => {
+	const { home, path } = fixture();
+	const team = join(home, ".prime-team", "agent");
+	mkdirSync(team, { recursive: true });
+	writeFileSync(join(team, "auth.json"), JSON.stringify({ model: { type: "api_key", key: "TEAM_ONLY" } }));
+	symlinkSync(join(team, "auth.json"), path);
+	expect(() => readUpstreamCredential(home, "model")).toThrow(/cannot safely read upstream/);
 });
 
 test("reads only complete snapshots while a separate process atomically replaces auth", async () => {

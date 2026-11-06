@@ -10,10 +10,11 @@ import {
 	mkdirSync,
 	openSync,
 	readSync,
+	realpathSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 
 const PORTABLE_FILES = ["settings.json", "models.json", "keybindings.json", "mcp-connections.json"] as const;
 const INCOMPLETE = ".team-bootstrap-incomplete";
@@ -50,8 +51,11 @@ function readPortableFile(
 	name: string,
 	source: boolean,
 ): { data: Buffer; parsed: Record<string, unknown> } | undefined {
-	const stat = statOrMissing(path);
-	if (!stat) return undefined;
+	const entry = statOrMissing(path);
+	if (!entry) return undefined;
+	// Resolve upstream links only. Team-owned files must remain private regular files.
+	if (source) path = realpathSync(path);
+	const stat = source ? lstatSync(path) : entry;
 	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("not a private regular file");
 	const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
 	try {
@@ -101,7 +105,6 @@ export function bootstrapTeamConfig(home: string): void {
 	const parent = join(home, ".prime-team");
 	const target = join(parent, "agent");
 	const sourceParent = join(home, ".prime");
-	const source = join(sourceParent, "agent");
 	const marker = join(parent, INCOMPLETE);
 	const deadline = Date.now() + MARKER_WAIT_MS;
 	if (assertDirectory(parent)) {
@@ -112,18 +115,60 @@ export function bootstrapTeamConfig(home: string): void {
 				throw new Error("Team bootstrap: unsafe Team auth.json; inspect links before retrying.");
 		}
 	}
-	if (!assertDirectory(sourceParent) || !assertDirectory(source)) return;
+	let source: string;
+	try {
+		if (!statOrMissing(sourceParent)) return;
+		const resolvedParent = realpathSync(sourceParent);
+		if (!lstatSync(resolvedParent).isDirectory()) throw new Error("not a directory");
+		const agentPath = join(resolvedParent, "agent");
+		if (!statOrMissing(agentPath)) return;
+		source = realpathSync(agentPath);
+		if (!lstatSync(source).isDirectory()) throw new Error("not a directory");
+	} catch {
+		console.error(
+			"Team bootstrap: cannot resolve upstream configuration directory; inspect ~/.prime/agent and its links. Continuing without import.",
+		);
+		return;
+	}
+	// Reject overlap even through upstream directory links. The importer must never write upstream.
+	const targetAbsolute = assertDirectory(target)
+		? realpathSync(target)
+		: join(realpathSync(home), ".prime-team", "agent");
+	const contains = (a: string, b: string) => {
+		const rel = relative(a, b);
+		return (
+			rel === "" ||
+			(!rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && rel !== ".." && !isAbsolute(rel))
+		);
+	};
+	if (contains(source, targetAbsolute) || contains(targetAbsolute, source)) {
+		console.error(
+			"Team bootstrap: upstream and Team configuration directories overlap; inspect ~/.prime/agent links. Continuing without import.",
+		);
+		return;
+	}
+	const warned = new Set<string>();
 	const readPair = (name: string) => {
+		let existing: ReturnType<typeof readPortableFile>;
 		try {
-			const existing = readPortableFile(join(target, name), name, false);
-			// Existing files are user-owned; missing credentials use the read-only overlay.
-			const upstream = existing ? undefined : readPortableFile(join(source, name), name, true);
-			return { existing, upstream };
+			existing = readPortableFile(join(target, name), name, false);
 		} catch {
-			throw new Error(
-				`Team bootstrap: cannot safely read or parse ${name}; inspect upstream and Team files, then retry. No existing files were overwritten.`,
-			);
+			throw new Error(`Team bootstrap: cannot safely read or parse Team ${name}; inspect the file before retrying.`);
 		}
+		let upstream: ReturnType<typeof readPortableFile>;
+		if (!existing) {
+			try {
+				upstream = readPortableFile(join(source, name), name, true);
+			} catch {
+				if (!warned.has(name)) {
+					console.error(
+						`Team bootstrap: cannot read upstream ${name}; inspect the file and its links. Continuing without importing it.`,
+					);
+					warned.add(name);
+				}
+			}
+		}
+		return { existing, upstream };
 	};
 	// Validate a complete configuration without acquiring the marker. Recheck the marker
 	// after the scan so an import already in progress cannot be mistaken for completion.

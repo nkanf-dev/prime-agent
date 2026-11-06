@@ -193,12 +193,14 @@ test("unsafe or malformed upstream credentials fail without exposing contents", 
 });
 
 // test-policy: allow conditional-or-disabled-test -- Windows requires developer mode or elevation to create file symlinks; Linux CI runs this test.
-test.skipIf(process.platform === "win32")("rejects a symlinked upstream auth file", () => {
+test.skipIf(process.platform === "win32")("reads a symlinked upstream auth file without changing it", () => {
 	const dir = home();
 	const original = join(dir, "target.json");
-	writeFileSync(original, "{}");
+	const credentials = JSON.stringify({ example: { type: "api_key", key: "FAKE_LINK_SECRET" } });
+	writeFileSync(original, credentials);
 	symlinkSync(original, join(dir, ".prime", "agent", "auth.json"));
-	expect(() => readUpstreamCredential(dir, "example")).toThrow(/cannot safely read/);
+	expect(readUpstreamCredential(dir, "example")).toEqual({ type: "api_key", key: "FAKE_LINK_SECRET" });
+	expect(readFileSync(original, "utf8")).toBe(credentials);
 });
 
 test.each(["malformed", "oversize"])(
@@ -437,4 +439,100 @@ test("concurrent Team logout and another provider login preserve both changes", 
 	} finally {
 		for (const child of children) child.kill();
 	}
+});
+
+test("version remains available when upstream settings are malformed without disclosing data", () => {
+	const dir = home();
+	const settings = join(dir, ".prime", "agent", "settings.json");
+	writeFileSync(settings, "FAKE_DAMAGED_CONFIGURATION_SECRET");
+	const env = {
+		...process.env,
+		HOME: dir,
+		USERPROFILE: dir,
+		TMPDIR: dir,
+		PI_OFFLINE: "1",
+		PRIME_AGENT_TEAM_CODING_AGENT_DIR: "",
+		PI_PACKAGE_DIR: "",
+	};
+	const result = spawnSync(process.execPath, ["--import", "tsx", join(process.cwd(), "src", "cli.ts"), "--version"], {
+		cwd: process.cwd(),
+		env,
+		encoding: "utf8",
+		timeout: 15000,
+	});
+	expect(result.status, result.stderr).toBe(0);
+	expect(result.stdout + result.stderr).toMatch(/0\.9\.8/);
+	expect(result.stderr).toMatch(/Team bootstrap:.*settings/);
+	expect(result.stdout + result.stderr).not.toContain("FAKE_DAMAGED_CONFIGURATION_SECRET");
+	expect(readFileSync(settings, "utf8")).toBe("FAKE_DAMAGED_CONFIGURATION_SECRET");
+});
+
+test("default Team version and auth work with a junction-style upstream directory", () => {
+	const dir = home();
+	const prime = join(dir, ".prime");
+	const relocated = join(dir, "other-drive", "prime");
+	mkdirSync(join(relocated, "agent"), { recursive: true });
+	const settings = JSON.stringify({ defaultProvider: "anthropic", defaultModel: "claude-fable-5" });
+	const auth = JSON.stringify({ anthropic: { type: "api_key", key: "FAKE_JUNCTION_API_KEY" } });
+	writeFileSync(join(relocated, "agent", "settings.json"), settings);
+	writeFileSync(join(relocated, "agent", "auth.json"), auth);
+	rmSync(prime, { recursive: true });
+	symlinkSync(relocated, prime, "junction");
+	const env = {
+		...process.env,
+		HOME: dir,
+		USERPROFILE: dir,
+		TMPDIR: dir,
+		PI_OFFLINE: "1",
+		PRIME_AGENT_TEAM_CODING_AGENT_DIR: "",
+		PI_PACKAGE_DIR: "",
+		ANTHROPIC_API_KEY: "",
+	};
+	const version = spawnSync(process.execPath, ["--import", "tsx", join(process.cwd(), "src", "cli.ts"), "--version"], {
+		cwd: process.cwd(),
+		env,
+		encoding: "utf8",
+		timeout: 15000,
+	});
+	expect(version.status, version.stderr).toBe(0);
+	expect(version.stdout + version.stderr).toMatch(/0\.9\.8/);
+	const script = `import { AuthStorage } from "./src/core/auth-storage.ts"; const auth = AuthStorage.create(); if (await auth.getApiKey("anthropic") !== "FAKE_JUNCTION_API_KEY" || auth.getAuthStatus("anthropic").source !== "upstream") process.exit(2);`;
+	const probe = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+		cwd: process.cwd(),
+		env,
+		encoding: "utf8",
+		timeout: 15000,
+	});
+	expect(probe.status, probe.stderr).toBe(0);
+	expect(version.stdout + version.stderr + probe.stdout + probe.stderr).not.toContain("FAKE_JUNCTION_API_KEY");
+	expect(JSON.parse(readFileSync(join(dir, ".prime-team", "agent", "settings.json"), "utf8"))).toEqual(
+		JSON.parse(settings),
+	);
+	expect(readFileSync(join(relocated, "agent", "settings.json"), "utf8")).toBe(settings);
+	expect(readFileSync(join(relocated, "agent", "auth.json"), "utf8")).toBe(auth);
+});
+
+// test-policy: allow conditional-or-disabled-test -- creating a dangling directory symlink on Windows requires elevation or Developer Mode; Linux CI covers the error path.
+test.skipIf(process.platform === "win32")("version reports a dangling upstream link without failing", () => {
+	const dir = home();
+	rmSync(join(dir, ".prime"), { recursive: true });
+	symlinkSync(join(dir, "missing-drive"), join(dir, ".prime"), "dir");
+	const env = {
+		...process.env,
+		HOME: dir,
+		USERPROFILE: dir,
+		TMPDIR: dir,
+		PI_OFFLINE: "1",
+		PRIME_AGENT_TEAM_CODING_AGENT_DIR: "",
+		PI_PACKAGE_DIR: "",
+	};
+	const result = spawnSync(process.execPath, ["--import", "tsx", join(process.cwd(), "src", "cli.ts"), "--version"], {
+		cwd: process.cwd(),
+		env,
+		encoding: "utf8",
+		timeout: 15000,
+	});
+	expect(result.status, result.stderr).toBe(0);
+	expect(result.stdout + result.stderr).toMatch(/0\.9\.8/);
+	expect(result.stderr).toMatch(/cannot resolve upstream/);
 });
