@@ -79,6 +79,15 @@ Do not directly write, modify, forge or simulate native journal, outbox or
 marker files (including `native-mesh-operations`). Never manually construct an
 `nm1m` filename or use a custom helper to bypass the official API.
 
+Never directly modify broker SQLite data, delete messages, manually change or
+forge ACKs, or fabricate read receipts. Never manually purge, clear, or reset a
+queue, or bypass normal persistence to remove pending messages. Let the official
+worker/supervisor flow ACK naturally only after the worker has actually persisted
+the message. An anomalous or audit-mismatched ACK is not evidence of delivery
+or reading; preserve it for controlled reconciliation through supported
+interfaces. Do not manually ACK or blindly resend the message. The controlled
+same-ID retry conditions above remain applicable only when every condition is met.
+
 These instructions are advisory, not a security boundary. They cannot replace
 OS identity isolation or daemon-side authentication, authorization and
 protection of native message state.
