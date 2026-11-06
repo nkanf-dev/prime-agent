@@ -2216,10 +2216,14 @@ export class SessionManager {
 	/**
 	 * Sync an already persisted entry for callers that must not acknowledge an
 	 * unsynced write. This does not flush buffered entries or repair a stale file.
-	 * Syncs canonical directory ancestors to the root as well as the file.
+	 * On Unix, syncs canonical directory ancestors to the root as well as the file.
+	 * Windows syncs the file only: Node cannot fsync directories there, so new
+	 * directory entries may be lost after a power failure. Windows also lacks
+	 * atomic no-follow opens; identity and resolved paths are checked before and
+	 * after syncing and reading, but cannot eliminate all replacement races.
 	 * Throws if the file, entry, session identity, directory chain, or resolved
 	 * original path changed. The session file itself may not be a symlink.
-	 * Fails on platforms without no-follow/directory opens or directory fsync.
+	 * Unix fails on platforms without no-follow/directory opens or directory fsync.
 	 * Filesystem and hardware durability semantics still apply.
 	 */
 	syncPersistedEntry(entryId: string): void {
@@ -2231,7 +2235,8 @@ export class SessionManager {
 			throw new Error(`Session entry ${entryId} is not persisted`);
 		}
 		if (this.storageWriteError) throw this.storageWriteError;
-		if (constants.O_NOFOLLOW === undefined || constants.O_DIRECTORY === undefined) {
+		const windows = process.platform === "win32";
+		if (!windows && (constants.O_NOFOLLOW === undefined || constants.O_DIRECTORY === undefined)) {
 			throw new Error("Safe session sync is not supported on this platform");
 		}
 		// Sync from the containing directory to the root. A newly-created session
@@ -2239,20 +2244,26 @@ export class SessionManager {
 		const directories: { path: string; fd: number }[] = [];
 		const originalDirectory = dirname(path);
 		const canonicalDirectory = realpathSync(originalDirectory);
+		const canonicalFile = windows ? realpathSync(path) : undefined;
+		if (windows && !lstatSync(path).isFile()) throw new Error(`Session file changed during sync: ${path}`);
 		let syncError: unknown;
 		let failed = false;
 		try {
 			let directory = canonicalDirectory;
-			for (;;) {
-				directories.push({
-					path: directory,
-					fd: openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW),
-				});
-				const parent = dirname(directory);
-				if (parent === directory) break;
-				directory = parent;
+			if (!windows) {
+				for (;;) {
+					directories.push({
+						path: directory,
+						fd: openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW),
+					});
+					const parent = dirname(directory);
+					if (parent === directory) break;
+					directory = parent;
+				}
 			}
-			const fileFd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+			// Windows FlushFileBuffers requires a handle opened with write access.
+			// No writes are performed through this handle.
+			const fileFd = openSync(path, windows ? constants.O_RDWR : constants.O_RDONLY | constants.O_NOFOLLOW);
 			try {
 				const sameIdentity = (a: ReturnType<typeof fstatSync>, b: ReturnType<typeof fstatSync>) =>
 					a.dev === b.dev && a.ino === b.ino;
@@ -2263,7 +2274,8 @@ export class SessionManager {
 					const pathStat = lstatSync(path);
 					if (
 						realpathSync(originalDirectory) !== canonicalDirectory ||
-						!sameIdentity(fstatSync(directories[0]!.fd), statSync(originalDirectory))
+						(!windows && !sameIdentity(fstatSync(directories[0]!.fd), statSync(originalDirectory))) ||
+						(windows && realpathSync(path) !== canonicalFile)
 					)
 						throw new Error(`Session directory changed during sync: ${originalDirectory}`);
 					for (const directory of directories) {

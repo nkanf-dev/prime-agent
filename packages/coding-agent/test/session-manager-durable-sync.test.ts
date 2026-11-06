@@ -15,13 +15,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
 	fsync: vi.fn<typeof import("node:fs").fsyncSync>(),
+	open: vi.fn<typeof import("node:fs").openSync>(),
 	actualFsync: undefined as typeof import("node:fs").fsyncSync | undefined,
 }));
 vi.mock("fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	mocks.actualFsync = actual.fsyncSync;
 	mocks.fsync.mockImplementation(actual.fsyncSync);
-	return { ...actual, fsyncSync: mocks.fsync };
+	mocks.open.mockImplementation(actual.openSync);
+	return { ...actual, fsyncSync: mocks.fsync, openSync: mocks.open };
 });
 
 import { SessionManager } from "../src/core/session-manager.js";
@@ -66,6 +68,46 @@ describe("SessionManager.syncPersistedEntry", () => {
 		manager.syncPersistedEntry(entryId);
 		expect(synced).toEqual(expected);
 	});
+	it("syncs and validates the session file without directory handles on Windows", async () => {
+		const actual = await import("node:fs");
+		const { manager, entryId, file } = create();
+		const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+		const synced: string[] = [];
+		mocks.fsync.mockImplementation((fd) => {
+			const stat = actual.fstatSync(fd);
+			synced.push(stat.isFile() ? "file" : "directory");
+			mocks.actualFsync!(fd);
+		});
+		try {
+			Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+			mocks.open.mockClear();
+			manager.syncPersistedEntry(entryId);
+			expect(synced).toEqual(["file"]);
+			expect(mocks.open).toHaveBeenCalledWith(file, actual.constants.O_RDWR);
+			writeFileSync(file, readFileSync(file, "utf8").replace("hello", "world"));
+			expect(() => manager.syncPersistedEntry(entryId)).toThrow();
+		} finally {
+			Object.defineProperty(process, "platform", platform);
+		}
+	});
+
+	it("rejects a replaced file during Windows sync", () => {
+		const { manager, entryId, file } = create();
+		const replacement = `${file}.replacement`;
+		copyFileSync(file, replacement);
+		const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+		mocks.fsync.mockImplementationOnce((fd) => {
+			mocks.actualFsync!(fd);
+			renameSync(replacement, file);
+		});
+		try {
+			Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+			expect(() => manager.syncPersistedEntry(entryId)).toThrow();
+		} finally {
+			Object.defineProperty(process, "platform", platform);
+		}
+	});
+
 	it("rejects missing and buffered entries", () => {
 		const manager = SessionManager.inMemory("/tmp");
 		const id = manager.appendCustomEntry("buffered");

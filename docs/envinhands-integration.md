@@ -193,6 +193,9 @@ runtime receipt. Do not promote local evidence into full feasibility.
 On Windows, Node.js cannot sync directories with `fsync`. Prime Agent syncs journal
 and outbox file contents before publishing them, but cannot guarantee that new
 or removed directory entries survive sudden power loss. After power loss, native
-mesh operations may need recovery or retry and can be lost or replayed. Linux and
-macOS retain directory syncing and propagate sync errors. This limitation applies
+mesh operations may need recovery or retry and can be lost or replayed. Session
+files are also synced without their parent directories on Windows, and file and
+path identity checks cannot eliminate every replacement race without no-follow
+opens. Linux and macOS retain directory syncing and propagate sync errors. This
+limitation applies
 to native mesh, not only to the daemon socket.
