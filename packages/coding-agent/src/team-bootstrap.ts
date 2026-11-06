@@ -1,13 +1,15 @@
-/** One-way, first-run import of portable Prime Agent configuration. */
+/** One-way import of portable Prime Agent configuration. */
+import { randomUUID } from "node:crypto";
 import {
 	closeSync,
 	constants,
 	fstatSync,
+	fsyncSync,
+	linkSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
-	rmdirSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -30,7 +32,6 @@ function statOrMissing(path: string) {
 		throw error;
 	}
 }
-
 function assertDirectory(path: string): boolean {
 	const stat = statOrMissing(path);
 	if (!stat) return false;
@@ -38,132 +39,118 @@ function assertDirectory(path: string): boolean {
 		throw new Error("Team bootstrap: unsafe configuration directory; inspect the directory and remove any symlinks.");
 	return true;
 }
-
-function readPortableFile(path: string, name: string): Buffer | undefined {
+function readPortableFile(
+	path: string,
+	name: string,
+	source: boolean,
+): { data: Buffer; parsed: Record<string, unknown> } | undefined {
 	const stat = statOrMissing(path);
 	if (!stat) return undefined;
-	if (!stat.isFile() || stat.isSymbolicLink())
-		throw new Error(`Team bootstrap: ${name} is not a regular file; inspect the upstream configuration.`);
-	// O_NOFOLLOW also protects against a final-component symlink swap where supported.
+	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("not a private regular file");
 	const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
 	try {
-		if (!fstatSync(fd).isFile()) throw new Error("not a regular file");
+		const opened = fstatSync(fd);
+		if (!opened.isFile() || opened.nlink !== 1 || opened.ino !== stat.ino || opened.dev !== stat.dev)
+			throw new Error("file changed");
 		const data = readFileSync(fd);
-		let source = data.toString("utf8");
-		if (name === "models.json") {
-			// Match the custom-model loader's JSON-with-comments support.
-			source = source
+		let text = data.toString("utf8");
+		if (name === "models.json")
+			text = text
 				.replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (m) => (m[0] === '"' ? m : ""))
 				.replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (m, tail) => tail ?? (m[0] === '"' ? m : ""));
-		}
-		const parsed: unknown = JSON.parse(source);
+		const parsed: unknown = JSON.parse(text);
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("expected an object");
-		if (name === "settings.json" && Object.hasOwn(parsed, "sessionDir")) {
-			// A legacy custom session directory would defeat Team isolation.
-			delete (parsed as Record<string, unknown>).sessionDir;
-			return Buffer.from(`${JSON.stringify(parsed, null, 2)}\n`);
+		const object = parsed as Record<string, unknown>;
+		if (source && name === "settings.json" && Object.hasOwn(object, "sessionDir")) {
+			delete object.sessionDir;
+			return { data: Buffer.from(`${JSON.stringify(object, null, 2)}\n`), parsed: object };
 		}
-		return data;
+		return { data, parsed: object };
 	} finally {
 		closeSync(fd);
 	}
+}
+
+function ensureDirectory(path: string): void {
+	if (assertDirectory(path)) return;
+	try {
+		mkdirSync(path, { mode: 0o700 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+	}
+	if (!assertDirectory(path)) throw new Error("directory unavailable");
 }
 
 /** Call only for the Team default path, never for an explicit directory override. */
 export function bootstrapTeamConfig(home: string): void {
 	const parent = join(home, ".prime-team");
 	const target = join(parent, "agent");
-	const marker = join(parent, INCOMPLETE);
-	const checkMarker = () => {
-		if (statOrMissing(marker))
-			throw new Error(
-				"Team bootstrap: import is in progress or was interrupted. Inspect ~/.prime-team/agent and remove ~/.prime-team/.team-bootstrap-incomplete after repairing it; upstream data was not changed.",
-			);
-	};
-	if (assertDirectory(parent)) {
-		checkMarker();
-		if (assertDirectory(target)) {
-			checkMarker();
-			return;
-		}
-	}
 	const sourceParent = join(home, ".prime");
 	const source = join(sourceParent, "agent");
-	if (!assertDirectory(sourceParent) || !assertDirectory(source)) return;
-
-	// Read and validate every input before creating a target. Never include file contents or parser errors in messages.
-	const files = new Map<string, Buffer>();
-	for (const name of PORTABLE_FILES) {
-		try {
-			const data = readPortableFile(join(source, name), name);
-			if (data !== undefined) files.set(name, data);
-		} catch {
+	const marker = join(parent, INCOMPLETE);
+	if (assertDirectory(parent)) {
+		if (statOrMissing(marker))
 			throw new Error(
-				`Team bootstrap: cannot safely read or parse upstream ${name}. Fix it or set PRIME_AGENT_TEAM_CODING_AGENT_DIR to a separate configuration directory; upstream data was not changed.`,
+				"Team bootstrap: import is in progress or interrupted. After stopping Team processes, inspect ~/.prime-team/agent and remove ~/.prime-team/.team-bootstrap-incomplete to resume; upstream data was not changed.",
 			);
-		}
+		assertDirectory(target);
 	}
-	if (!files.size) return;
+	if (!assertDirectory(sourceParent) || !assertDirectory(source)) return;
 	try {
-		if (!assertDirectory(parent)) {
-			try {
-				mkdirSync(parent, { mode: 0o700 });
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			}
-			assertDirectory(parent);
-		}
-		// The exclusive marker exists before the target. Other Team startups reject
-		// an in-progress or interrupted import, including after a process crash.
-		const markerFd = openSync(marker, "wx", 0o600);
-		closeSync(markerFd);
-		const created: string[] = [];
-		let ownsTarget = false;
-		try {
-			if (assertDirectory(target)) {
-				unlinkSync(marker);
-				return;
-			}
-			mkdirSync(target, { mode: 0o700 });
-			ownsTarget = true;
-			for (const [name, data] of files) {
-				const fd = openSync(join(target, name), "wx", 0o600);
-				created.push(name);
-				try {
-					writeFileSync(fd, data);
-				} finally {
-					closeSync(fd);
-				}
-			}
-			unlinkSync(marker);
-		} catch (error) {
-			let cleaned = true;
-			for (const name of created.reverse()) {
-				try {
-					unlinkSync(join(target, name));
-				} catch {
-					cleaned = false;
-				}
-			}
-			if (ownsTarget && cleaned) {
-				try {
-					rmdirSync(target);
-				} catch {
-					cleaned = false;
-				}
-			}
-			// Keep the marker if cleanup failed, so a later startup cannot mistake
-			// a partial import for an existing, complete user configuration.
-			if (cleaned) {
-				try {
-					unlinkSync(marker);
-				} catch {}
-			}
-			throw error;
-		}
+		ensureDirectory(parent);
 	} catch {
 		throw new Error(
-			"Team bootstrap: could not safely create Team configuration. Inspect ~/.prime-team/agent and retry; upstream data was not changed.",
+			"Team bootstrap: cannot safely create Team configuration directory; upstream data was not changed.",
 		);
+	}
+	let markerFd: number;
+	try {
+		markerFd = openSync(marker, "wx", 0o600);
+	} catch {
+		throw new Error(
+			"Team bootstrap: another import is in progress or interrupted. Stop Team processes and inspect ~/.prime-team/.team-bootstrap-incomplete before removing it to retry.",
+		);
+	}
+	closeSync(markerFd);
+	try {
+		ensureDirectory(target);
+		for (const name of PORTABLE_FILES) {
+			let existing: ReturnType<typeof readPortableFile>;
+			let upstream: ReturnType<typeof readPortableFile>;
+			try {
+				existing = readPortableFile(join(target, name), name, false);
+				// Existing files are user-owned; missing credentials use the read-only overlay.
+				if (!existing) upstream = readPortableFile(join(source, name), name, true);
+			} catch {
+				throw new Error(
+					`Team bootstrap: cannot safely read or parse ${name}; inspect upstream and Team files, then retry. No existing files were overwritten.`,
+				);
+			}
+
+			if (existing || !upstream) continue;
+			// Hard-link publication is atomic and fails if a competing writer created the target.
+			const temporary = join(target, `.team-bootstrap-${randomUUID()}.tmp`);
+			let fd: number | undefined;
+			try {
+				fd = openSync(temporary, "wx", 0o600);
+				writeFileSync(fd, upstream.data);
+				fsyncSync(fd);
+				closeSync(fd);
+				fd = undefined;
+				try {
+					linkSync(temporary, join(target, name));
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+					// A concurrent writer won; never overwrite it. Reject unsafe links.
+					readPortableFile(join(target, name), name, false);
+				}
+			} finally {
+				if (fd !== undefined) closeSync(fd);
+				if (statOrMissing(temporary)) unlinkSync(temporary);
+			}
+		}
+	} finally {
+		// Published files are complete and never rolled back; a retry fills remaining files.
+		unlinkSync(marker);
 	}
 }

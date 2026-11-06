@@ -238,10 +238,16 @@ describe("ProviderAuthFlows", () => {
 		expect(config.team_id).toBe("cli-team");
 		expect(config.team_name).toBe("CLI Research");
 		expect(config.team_role).toBe("admin");
-		expect(AuthStorage.create(authJsonPath).get(PRIME_INFERENCE_PROVIDER_ID)).toEqual({
+		expect(
+			AuthStorage.create(join(tempDir, ".prime-team", "agent", "auth.json")).get(PRIME_INFERENCE_PROVIDER_ID),
+		).toEqual({
 			type: "api_key",
 			key: "prime-cli-key",
 			primeTeam: { teamId: "cli-team", name: "CLI Research", role: "admin" },
+		});
+		expect(JSON.parse(readFileSync(authJsonPath, "utf8"))[PRIME_INFERENCE_PROVIDER_ID]).toEqual({
+			type: "api_key",
+			key: "legacy-agent-key",
 		});
 		expect(statusMessages.join("\n")).not.toContain(primeConfigPath);
 	});

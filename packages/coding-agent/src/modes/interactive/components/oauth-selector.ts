@@ -273,6 +273,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			return false;
 		}
 
+		if (status.source === "upstream") return status.configured && status.credentialType === provider.authType;
 		if (status.source && status.source !== "stored") {
 			return provider.authType === "api_key";
 		}
@@ -358,6 +359,10 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			return theme.fg("warning", status.label ?? "expired");
 		}
 
+		if (status.source === "upstream") {
+			if (status.credentialType !== provider.authType) return theme.fg("muted", "unconfigured");
+			return theme.fg(status.configured ? "success" : "warning", status.label ?? "upstream Prime Agent");
+		}
 		if (status.source && status.source !== "stored") {
 			return provider.authType === "api_key"
 				? this.formatApiKeyStatusIndicator(status)

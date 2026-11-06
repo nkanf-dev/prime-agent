@@ -989,10 +989,11 @@ export class ModelRegistry {
 	}
 
 	private isUsingXaiSubscription(model: Model<Api>): boolean {
+		if (model.provider !== "xai") return false;
+		const status = this.getProviderAuthStatus("xai");
 		return (
-			model.provider === "xai" &&
-			this.authStorage.get("xai")?.type === "oauth" &&
-			this.getProviderAuthStatus("xai").source === "stored"
+			(status.source === "stored" && this.authStorage.get("xai")?.type === "oauth") ||
+			(status.source === "upstream" && status.configured && status.credentialType === "oauth")
 		);
 	}
 
@@ -1829,7 +1830,9 @@ export class ModelRegistry {
 					};
 				}
 				const configuredModel = this.xaiModelSources.get(model) ?? model;
-				const subscription = credentialType === "oauth" && authSourceToken?.source === "stored";
+				const subscription =
+					credentialType === "oauth" &&
+					(authSourceToken?.source === "stored" || authSourceToken?.source === "upstream");
 				requestModel = subscription ? this.getXaiSubscriptionModel(configuredModel) : configuredModel;
 				if (!requestModel) {
 					return {
@@ -1859,7 +1862,11 @@ export class ModelRegistry {
 			}
 
 			if (requestHeaders) headers = { ...headers, ...requestHeaders };
-			if (model.provider === "xai" && credentialType === "oauth" && authSourceToken?.source === "stored") {
+			if (
+				model.provider === "xai" &&
+				credentialType === "oauth" &&
+				(authSourceToken?.source === "stored" || authSourceToken?.source === "upstream")
+			) {
 				for (const [name, value] of Object.entries(headers ?? {})) {
 					if (name.toLowerCase() === "authorization" && value !== `Bearer ${apiKey}`) {
 						return {
@@ -1889,7 +1896,11 @@ export class ModelRegistry {
 	 */
 	getProviderAuthStatus(provider: string): AuthStatus {
 		const authStatus = this.authStorage.getAuthStatus(provider);
-		if (authStatus.source && authStatus.source !== "stale") {
+		if (
+			authStatus.source &&
+			authStatus.source !== "stale" &&
+			!(authStatus.source === "upstream" && !authStatus.configured)
+		) {
 			return authStatus;
 		}
 

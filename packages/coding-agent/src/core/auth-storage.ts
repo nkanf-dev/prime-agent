@@ -7,6 +7,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import {
 	findEnvKeys,
 	getEnvApiKey,
@@ -18,10 +19,11 @@ import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-w
 import { closeSync, existsSync, fchmodSync, mkdirSync, openSync, readFileSync, writeSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
-import { getAgentDir } from "../config.js";
+import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, getAgentDir } from "../config.js";
 import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
 import { getPrimeCliConfigPath, PRIME_INFERENCE_PROVIDER_ID, type PrimeTeam } from "./prime-inference-auth.js";
 import { resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
+import { readUpstreamCredential } from "./team-auth-overlay.js";
 
 export type PrimeTeamCredential = {
 	teamId: string;
@@ -70,6 +72,7 @@ export type AuthStatus = {
 	configured: boolean;
 	source?:
 		| "stored"
+		| "upstream"
 		| "runtime"
 		| "environment"
 		| "prime_cli"
@@ -78,6 +81,7 @@ export type AuthStatus = {
 		| "models_json_command"
 		| "stale";
 	label?: string;
+	credentialType?: "api_key" | "oauth";
 };
 
 export type AuthStorageOptions = {
@@ -102,6 +106,7 @@ export type AuthSourceToken = {
 type AuthSourceCandidate = {
 	source: ActiveAuthStatusSource;
 	configured: boolean;
+	credentialType?: "api_key" | "oauth";
 	label?: string;
 	identityFingerprint: string;
 	valueFingerprint?: string;
@@ -295,13 +300,25 @@ export class AuthStorage {
 	private constructor(
 		private storage: AuthStorageBackend,
 		private options: AuthStorageOptions = {},
+		private upstreamHome?: string,
 	) {
 		this.reload();
 	}
 
 	static create(authPath?: string, options?: AuthStorageOptions): AuthStorage {
 		const authOptions = options ?? { usePrimeCliConfig: authPath === undefined };
-		return new AuthStorage(new FileAuthStorageBackend(authPath ?? join(getAgentDir(), "auth.json")), authOptions);
+		const upstreamHome =
+			authPath === undefined &&
+			APP_NAME === "prime-agent-team" &&
+			CONFIG_DIR_NAME === ".prime-team/agent" &&
+			!process.env[ENV_AGENT_DIR]
+				? homedir()
+				: undefined;
+		return new AuthStorage(
+			new FileAuthStorageBackend(authPath ?? join(getAgentDir(), "auth.json")),
+			authOptions,
+			upstreamHome,
+		);
 	}
 
 	static fromStorage(storage: AuthStorageBackend, options?: AuthStorageOptions): AuthStorage {
@@ -367,11 +384,13 @@ export class AuthStorage {
 		identityMaterial: string;
 		valueMaterial?: string;
 		label?: string;
+		credentialType?: "api_key" | "oauth";
 		resolveValueMaterial?: () => string | undefined;
 	}): AuthSourceCandidate {
 		return {
 			configured: options.configured,
 			source: options.source,
+			...(options.credentialType ? { credentialType: options.credentialType } : {}),
 			...(options.label ? { label: options.label } : {}),
 			identityFingerprint: this.fingerprintAuthSource(options.source, `identity:${options.identityMaterial}`),
 			...(options.valueMaterial !== undefined
@@ -457,6 +476,40 @@ export class AuthStorage {
 		});
 	}
 
+	private getUpstreamCredential(provider: string): AuthCredential | undefined {
+		if (!this.upstreamHome || this.loadError || Object.hasOwn(this.data, provider)) return undefined;
+		return readUpstreamCredential(this.upstreamHome, provider);
+	}
+
+	private getUpstreamAuthCandidate(
+		provider: string,
+		credential = this.getUpstreamCredential(provider),
+		resolvedCommandValue?: string,
+	): AuthSourceCandidate | undefined {
+		if (
+			!credential ||
+			(credential.type === "oauth" && (Date.now() >= credential.expires || !getOAuthProvider(provider)))
+		)
+			return undefined;
+		const isCommand = credential.type === "api_key" && credential.key.startsWith("!");
+		const identityMaterial = isCommand ? `api_key:command:${credential.key}` : `${provider}:${credential.type}`;
+		return this.createAuthSourceCandidate({
+			configured: true,
+			source: "upstream",
+			label: "upstream Prime Agent (read-only)",
+			credentialType: credential.type === "oauth" ? "oauth" : "api_key",
+			identityMaterial,
+			valueMaterial: isCommand
+				? resolvedCommandValue === undefined
+					? undefined
+					: `api_key:command:${credential.key}\0${resolvedCommandValue}`
+				: this.getStoredCredentialValueMaterial(provider, credential),
+			resolveValueMaterial: isCommand
+				? () => this.getStoredCredentialValueMaterial(provider, credential)
+				: undefined,
+		});
+	}
+
 	private getEnvironmentAuthCandidate(provider: string): AuthSourceCandidate | undefined {
 		const envKeys = findEnvKeys(provider);
 		const envKey = envKeys?.[0];
@@ -526,11 +579,13 @@ export class AuthStorage {
 						this.getRuntimeAuthCandidate(provider),
 						this.getEnvironmentAuthCandidate(provider),
 						this.getStoredAuthCandidate(provider),
+						this.getUpstreamAuthCandidate(provider),
 						fallbackCandidate,
 					]
 				: [
 						this.getRuntimeAuthCandidate(provider),
 						this.getStoredAuthCandidate(provider),
+						this.getUpstreamAuthCandidate(provider),
 						this.getEnvironmentAuthCandidate(provider),
 						fallbackCandidate,
 					];
@@ -575,6 +630,7 @@ export class AuthStorage {
 		return {
 			configured: candidate.configured,
 			source: candidate.source,
+			...(candidate.credentialType ? { credentialType: candidate.credentialType } : {}),
 			...(candidate.label ? { label: candidate.label } : {}),
 		};
 	}
@@ -612,6 +668,7 @@ export class AuthStorage {
 	}
 
 	getCurrentAuthSourceToken(provider: string): AuthSourceToken | undefined {
+		if (this.upstreamHome) this.reload();
 		const { candidate } = this.getAvailableAuthCandidate(provider);
 		if (!candidate) {
 			return undefined;
@@ -950,6 +1007,7 @@ export class AuthStorage {
 	 * Unlike getApiKey(), this doesn't refresh OAuth tokens.
 	 */
 	hasAuth(provider: string): boolean {
+		if (this.upstreamHome) this.reload();
 		return this.getAvailableAuthCandidate(provider).candidate !== undefined;
 	}
 
@@ -957,7 +1015,19 @@ export class AuthStorage {
 	 * Return auth status without exposing credential values or refreshing tokens.
 	 */
 	getAuthStatus(provider: string): AuthStatus {
-		return this.getAuthStatusFromCandidates(provider);
+		if (this.upstreamHome) this.reload();
+		const status = this.getAuthStatusFromCandidates(provider);
+		if (!status.source) {
+			const upstream = this.getUpstreamCredential(provider);
+			if (upstream?.type === "oauth" && Date.now() >= upstream.expires)
+				return {
+					configured: false,
+					source: "upstream",
+					credentialType: "oauth",
+					label: "upstream OAuth expired; log in to Team",
+				};
+		}
+		return status;
 	}
 
 	/**
@@ -1059,6 +1129,7 @@ export class AuthStorage {
 		providerId: string,
 		options?: { includeFallback?: boolean },
 	): Promise<AuthApiKeyResult> {
+		if (this.upstreamHome) this.reload();
 		// Runtime overrides take precedence over stored credentials and environment keys.
 		const runtimeCandidate = this.getRuntimeAuthCandidate(providerId);
 		const runtimeKey = this.runtimeOverrides.get(providerId);
@@ -1159,6 +1230,31 @@ export class AuthStorage {
 				}
 			}
 		}
+		// Upstream OAuth is read-only: refreshing it may rotate the shared token and
+		// invalidate the main application. Expired credentials require Team login.
+		const upstream = this.getUpstreamCredential(providerId);
+		const upstreamCandidate = upstream && this.getUpstreamAuthCandidate(providerId, upstream);
+		if (upstream && upstreamCandidate && !this.isAuthSourceStale(providerId, upstreamCandidate)) {
+			const hasStaleRecord = this.getMatchingStaleAuthSources(providerId, upstreamCandidate).length > 0;
+			const apiKey =
+				upstream.type === "api_key"
+					? upstream.key.startsWith("!") && hasStaleRecord
+						? resolveConfigValueUncached(upstream.key)
+						: resolveConfigValue(upstream.key)
+					: upstream.type === "oauth"
+						? getOAuthProvider(providerId)?.getApiKey(upstream)
+						: undefined;
+			const candidate =
+				apiKey !== undefined && upstream.type === "api_key" && upstream.key.startsWith("!")
+					? (this.getUpstreamAuthCandidate(providerId, upstream, apiKey) ?? upstreamCandidate)
+					: upstreamCandidate;
+			return {
+				apiKey,
+				credentialType: upstream.type,
+				sourceToken: apiKey === undefined ? undefined : this.getAuthSourceTokenForCandidate(providerId, candidate),
+			};
+		}
+
 		// Stored auth wins over environment variables for non-Prime-Inference providers.
 		if (
 			providerId !== PRIME_INFERENCE_PROVIDER_ID &&
@@ -1248,7 +1344,9 @@ export class AuthStorage {
 		// team-source change). Without this, boxes running with an ambient
 		// PRIME_API_KEY never send X-Prime-Team-ID, and the team-private
 		// internal/* routes disappear from /model.
-		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		if (this.upstreamHome) this.reload();
+		const credential =
+			this.data[PRIME_INFERENCE_PROVIDER_ID] ?? this.getUpstreamCredential(PRIME_INFERENCE_PROVIDER_ID);
 		return credential?.type === "api_key" ? credential.primeTeam : undefined;
 	}
 
