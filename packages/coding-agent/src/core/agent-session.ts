@@ -4279,6 +4279,7 @@ export class AgentSession {
 				return this._agentMessageController.sendAgentMessage({
 					target: assertDirectAgentMessageTarget(payload.target),
 					message: normalizeAgentSessionMessage(payload.message),
+					...(typeof payload.operationId === "string" ? { operationId: payload.operationId } : {}),
 					...(payload.targetKind === "name" ? { targetKind: "name" } : {}),
 					...(payload.receiverRole === "parent" ||
 					payload.receiverRole === "sibling" ||
@@ -11413,6 +11414,7 @@ export class AgentSession {
 						const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
 							target: input.target,
 							message: input.message,
+							...(input.operationId !== undefined ? { operationId: input.operationId } : {}),
 							receiverRole: input.receiverRole,
 							targetKind: input.targetKind,
 						})) as AgentSessionMessageReceipt;

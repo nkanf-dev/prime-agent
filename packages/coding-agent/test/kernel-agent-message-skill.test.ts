@@ -8,7 +8,11 @@ import {
 	type AgentSessionMessageController,
 	createAgentMessageHostHandlers,
 } from "../src/core/agent-messages.js";
-import type { KernelSentAgentMessage } from "../src/core/kernel/index.js";
+import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
+import type { HostRequestHandlers, KernelSentAgentMessage } from "../src/core/kernel/index.js";
+import { ModelRegistry } from "../src/core/model-registry.js";
+import { SessionManager } from "../src/core/session-manager.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
@@ -171,6 +175,76 @@ print(json.dumps({"has_list_agents": hasattr(agent_message, "list_agents"), "rec
 		expect(named.status).toBe("ok");
 		expect(requests[1].payload).toMatchObject({ receiver_name: "Beta", message: "hello name" });
 		expect(requests[1].payload).not.toHaveProperty("receiver_role");
+	});
+
+	it("round-trips exact operation IDs from Python through AgentSession to its controller", async () => {
+		const authStorage = AuthStorage.inMemory();
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry: ModelRegistry.inMemory(authStorage),
+			telemetryDisabled: true,
+			noBuiltinHerdrReporter: true,
+			resourceLoaderOptions: { noExtensions: true, noPromptTemplates: true, noThemes: true },
+		});
+		const inputs: Parameters<AgentSessionMessageController["sendAgentMessage"]>[0][] = [];
+		const controller: AgentSessionMessageController = {
+			listAgents: () => ({ agents: [] }),
+			family: async () => [
+				{
+					relationship: "parent",
+					entry: { id: "parent-id", depth: 0, status: "idle", sessionPath: join(tempDir, "parent.jsonl") },
+				},
+			],
+			sendAgentMessage: async (input) => {
+				inputs.push(input);
+				return {
+					id: `receipt-${inputs.length}`,
+					source: "agent_message",
+					target: { activeSessionId: input.target, sessionId: "target-session" },
+					message: input.message,
+					deliveryStatus: "stored",
+					...(input.operationId !== undefined ? { operationId: input.operationId } : {}),
+				};
+			},
+		};
+		const { session } = await createAgentSessionFromServices({
+			services,
+			sessionManager: SessionManager.inMemory(),
+			agentMessageController: controller,
+			prewarmIpythonKernel: false,
+		});
+		try {
+			const handlers = (
+				session as unknown as { _createKernelHostHandlers(): HostRequestHandlers }
+			)._createKernelHostHandlers();
+			expect(handlers["agent_message.send"]).toBeTypeOf("function");
+			provisioner = new IpythonKernelProvisioner(tempDir, {
+				pythonSkills: [bundledAgentMessageSkill()],
+				hostHandlers: handlers,
+			});
+			const manager = await provisioner.ensure();
+			const result = await manager.execute(`
+import json
+legacy = await agent_message.send("legacy", receiver_role="parent")
+role = await agent_message.send("role", receiver_role="parent", operation_id=" op-é/123 ")
+name = await agent_message.send("name", receiver_name="remote", operation_id=" op-é/123 ")
+print(json.dumps([legacy, role, name], ensure_ascii=False))
+`);
+			expect(result.status).toBe("ok");
+			const receipts = JSON.parse(result.stdout.trim());
+			expect(receipts[0]).not.toHaveProperty("operationId");
+			expect(receipts[1].operationId).toBe(" op-é/123 ");
+			expect(receipts[2].operationId).toBe(" op-é/123 ");
+			expect(inputs).toEqual([
+				{ target: "parent-id", message: "legacy", receiverRole: "parent" },
+				{ target: "parent-id", message: "role", receiverRole: "parent", operationId: " op-é/123 " },
+				{ target: "remote", message: "name", targetKind: "name", operationId: " op-é/123 " },
+			]);
+		} finally {
+			session.dispose();
+		}
 	});
 
 	it("validates and passes operation IDs through the host bridge", async () => {

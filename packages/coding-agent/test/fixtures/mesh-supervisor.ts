@@ -5,6 +5,7 @@ import { CotalEndpoint, type CotalMessage, credsClaims, type Delivery, mintCreds
 import {
 	type FauxResponseFactory,
 	fauxAssistantMessage,
+	fauxToolCall,
 	getApiProvider,
 	registerFauxProvider,
 } from "../../../ai/src/index.js";
@@ -115,7 +116,15 @@ for (const factory of ["create", "inMemory"] as const) {
 		return registry;
 	}) as typeof original;
 }
+let pythonCallIssued = false;
 const response: FauxResponseFactory = async (_context, options) => {
+	const pythonInput = join(agentDir, "python-agent-message.json");
+	// test-policy: allow environment-gated-path -- The opt-in selects an isolated fixture's faux tool call; the default no-tools process tests remain unchanged.
+	if (process.env.PRIME_MESH_TEST_PYTHON === "1" && !pythonCallIssued && existsSync(pythonInput)) {
+		pythonCallIssued = true;
+		const { code } = JSON.parse(readFileSync(pythonInput, "utf8")) as { code: string };
+		return fauxAssistantMessage(fauxToolCall("ipython", { code }), { stopReason: "toolUse" });
+	}
 	const path = join(agentDir, "hold-turn");
 	if (existsSync(path)) {
 		writeFileAtomicSync(join(agentDir, "turn-held"), "held");
@@ -390,7 +399,7 @@ else {
 			sessionDir: process.env.PRIME_MESH_TEST_SESSION_DIR ?? join(agentDir, "sessions"),
 			provider: "faux",
 			model: "mesh-faux",
-			noTools: true,
+			noTools: process.env.PRIME_MESH_TEST_PYTHON !== "1",
 			noExtensions: !existsSync(join(agentDir, "extensions", "rebind.ts")),
 			telemetryDisabled: true,
 		},
