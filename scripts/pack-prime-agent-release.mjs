@@ -39,11 +39,16 @@ function parseArgs(args) {
 		outDir: defaultOutputDir,
 		version: undefined,
 		binaryDir: undefined,
+		githubFlat: false,
 	};
 
 	for (let i = 0; i < args.length; i += 1) {
 		const arg = args[i];
 		switch (arg) {
+			case "--github-flat": {
+				parsed.githubFlat = true;
+				break;
+			}
 			case "--binary-dir": {
 				const value = args[i + 1];
 				if (!value) throw new Error("--binary-dir requires a value");
@@ -100,15 +105,29 @@ function parseArgs(args) {
 	}
 
 	parsed.baseUrl = parsed.baseUrl.replace(/\/+$/, "");
+	if (parsed.githubFlat) {
+		const semverNumber = "(?:0|[1-9][0-9]*)";
+		const semverPrerelease = "(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)";
+		const semverBuild = "[0-9A-Za-z-]+";
+		const semver = new RegExp(`^${semverNumber}\\.${semverNumber}\\.${semverNumber}(?:-${semverPrerelease}(?:\\.${semverPrerelease})*)?(?:\\+${semverBuild}(?:\\.${semverBuild})*)?$`);
+		if (!parsed.version || !semver.test(parsed.version)) {
+			throw new Error("--github-flat requires a fixed semantic version");
+		}
+		const url = new URL(parsed.baseUrl);
+		const loopback = process.env.PRIME_AGENT_ALLOW_INSECURE_HTTP_FOR_TESTS === "1" && url.protocol === "http:" && url.hostname === "127.0.0.1" && url.port;
+		if ((url.protocol !== "https:" && !loopback) || url.username || url.password || url.search || url.hash) {
+			throw new Error("--github-flat requires an HTTPS base URL");
+		}
+	}
 	return parsed;
 }
 
 function printHelp() {
-	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version x.y.z] [--out-dir path] [--binary-dir path]
+	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version x.y.z] [--out-dir path] [--binary-dir path] [--github-flat]
 
-Creates private npm tarballs for R2 distribution:
+Creates private npm tarballs for distribution:
 
-  <out-dir>/artifacts/prime-agent-<version>.tgz
+  <out-dir>/artifacts/prime-agent-team-<version>.tgz
   <out-dir>/artifacts/prime-agent-ai-<version>.tgz
   <out-dir>/artifacts/prime-agent-core-<version>.tgz
   <out-dir>/artifacts/prime-agent-tui-<version>.tgz
@@ -116,7 +135,9 @@ Creates private npm tarballs for R2 distribution:
   <out-dir>/artifacts/<channel>
   <out-dir>/artifacts/latest.json (stable) or beta.json (beta)
 
-Add --binary-dir packages/coding-agent/binaries to include every standalone platform archive.
+Use --github-flat with a fixed --version and a trusted GitHub repository base URL.
+It points internal packages at releases/download/team-v<version>/<asset>.
+Team native archives are not supported.
 `);
 }
 
@@ -170,8 +191,13 @@ function npmTarballName(packageName, version) {
 	return `${packageName.replace(/^@/, "").replace("/", "-")}-${version}.tgz`;
 }
 
-function releaseTarballUrl(baseUrl, version, tarballFile) {
-	return `${baseUrl}/releases/v${version}/${tarballFile}`;
+function releaseTarballPath(version, tarballFile, githubFlat) {
+	if (githubFlat) return `releases/download/team-v${encodeURIComponent(version)}/${encodeURIComponent(tarballFile)}`;
+	return `releases/v${version}/${tarballFile}`;
+}
+
+function releaseTarballUrl(baseUrl, version, tarballFile, githubFlat) {
+	return `${baseUrl}/${releaseTarballPath(version, tarballFile, githubFlat)}`;
 }
 
 function rewriteInternalDependencies(dependencies, internalPackageUrls) {
@@ -257,6 +283,7 @@ export function writeReleaseMetadata({
 	codingAgentTarball,
 	tarballs,
 	binaries,
+	githubFlat = false,
 }) {
 	writeFileSync(
 		join(artifactsDir, "SHA256SUMS"),
@@ -270,7 +297,7 @@ export function writeReleaseMetadata({
 	writeJson(join(artifactsDir, manifestName), {
 		version: `v${releaseVersion}`,
 		package: publicPackageName,
-		tarball: `releases/v${releaseVersion}/${codingAgentTarball}`,
+		tarball: releaseTarballPath(releaseVersion, codingAgentTarball, githubFlat),
 		...(binariesV1.length > 0 ? { binaries: binariesV1 } : {}),
 		...(binaries.length > 0 ? { binariesV2: binaries } : {}),
 		tarballs: tarballs.map((tarball) => ({
@@ -317,7 +344,7 @@ function main() {
 		if (releasePackage.packageDir === "coding-agent") continue;
 		const sourcePackageName = sourcePackageNames.get(releasePackage.packageDir);
 		const artifactFile = artifactFiles.get(releasePackage.packageDir);
-		internalPackageUrls.set(sourcePackageName, releaseTarballUrl(args.baseUrl, releaseVersion, artifactFile));
+		internalPackageUrls.set(sourcePackageName, releaseTarballUrl(args.baseUrl, releaseVersion, artifactFile, args.githubFlat));
 	}
 
 	const stagingRoot = join(args.outDir, "packages");
@@ -385,6 +412,7 @@ function main() {
 		codingAgentTarball: artifactFiles.get("coding-agent"),
 		tarballs,
 		binaries,
+		githubFlat: args.githubFlat,
 	});
 
 	for (const artifact of [...tarballs, ...binaries]) {

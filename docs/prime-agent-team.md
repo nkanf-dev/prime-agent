@@ -2,13 +2,22 @@
 
 This fork uses the `prime-agent-team` command and the `.prime-team/agent`
 configuration directory. It is separate from the upstream `prime-agent` command
-and `~/.prime/agent`. On first use, if the default Team configuration directory does not exist,
-Team imports selected configuration from `~/.prime/agent`. It copies
-`settings.json`, `models.json`, `auth.json`, `keybindings.json`, and
-`mcp-connections.json` when present. The `sessionDir` setting is omitted to keep Team sessions separate. Credentials are sensitive: review local
-access controls and back up the Team directory accordingly. Team never writes
-back to the upstream directory. Existing Team directories are never migrated
-or overwritten. An explicit `PRIME_AGENT_TEAM_CODING_AGENT_DIR` bypasses import.
+and `~/.prime/agent`. On first use and when a Team configuration file is missing,
+Team imports selected configuration from `~/.prime/agent`: `settings.json`,
+`models.json`, `keybindings.json`, and `mcp-connections.json` when present. It
+never copies the upstream `auth.json`. Existing Team files are never overwritten,
+including an empty `auth.json`. When a Team provider has no credential, the default Team profile can
+read a model provider's upstream credential as a read-only fallback. Team
+credentials and explicitly configured environment keys take precedence. Team
+login and logout change only Team's own file; logout suppresses fallback for
+that provider until a Team login. MCP and other non-model service credentials
+are not imported through this fallback. An unexpired upstream OAuth access token
+can be used, but Team never refreshes or rotates it: when it expires, sign in
+separately in Team. The `sessionDir` setting is omitted
+to keep Team sessions separate. Credentials are sensitive: review local access
+controls and back up the Team directory accordingly. Team never writes back to the
+upstream directory. An explicit `PRIME_AGENT_TEAM_CODING_AGENT_DIR` bypasses
+import and the upstream credential fallback.
 
 ## Paths and overrides
 
@@ -60,7 +69,8 @@ Replace the URL with the trusted release server. Publish the packer's complete
 `SHA256SUMS` are under `releases/v<version>/`. For example, build using the
 existing release packer with `--base-url` set to that same URL. The internal
 package tarballs in the release reference that URL. The release version must
-also be accepted by `install.sh` (use a version without `+` build metadata).
+also be accepted by `install.sh`. SemVer build metadata such as
+`0.9.8+fork.4` is supported; unsafe path and URL characters are rejected.
 The checksum file is fetched from the same server; it is not a signature, so
 trust in the HTTPS host and distribution of the installer is required.
 

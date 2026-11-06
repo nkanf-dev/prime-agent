@@ -73,6 +73,10 @@ main() {
 		prime_agent_native_platform
 		return
 	fi
+	if [ "${PRIME_AGENT_RELEASE_LAYOUT:-standard}" = github ] && [ "${PRIME_AGENT_INSTALL_METHOD:-auto}" != node ]; then
+		printf 'error: GitHub Team releases support only the Node installation.\n' >&2
+		exit 1
+	fi
 	case "${PRIME_AGENT_INSTALL_METHOD:-auto}" in
 		auto|binary|node) ;;
 		*) printf 'error: PRIME_AGENT_INSTALL_METHOD must be auto, binary or node.\n' >&2; exit 1 ;;
@@ -92,6 +96,24 @@ main() {
 }
 
 prime_agent_install_node() {
+	case "${PRIME_AGENT_RELEASE_LAYOUT:-standard}" in
+		standard) ;;
+		github)
+			if [ "$#" -ne 1 ]; then
+				printf 'error: GitHub Team releases require one fixed version.\n' >&2
+				exit 1
+			fi
+			version=$(normalize_version "$1")
+			semver_number='(0|[1-9][0-9]*)'
+			semver_prerelease='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+			semver_build='[0-9A-Za-z-]+'
+			if ! printf '%s\n' "$version" | LC_ALL=C grep -Eq "^$semver_number\.$semver_number\.$semver_number(-$semver_prerelease(\.$semver_prerelease)*)?(\+$semver_build(\.$semver_build)*)?$"; then
+				printf 'error: invalid GitHub Team release version: %s\n' "$1" >&2
+				exit 1
+			fi
+			;;
+		*) printf 'error: invalid release layout.\n' >&2; exit 1 ;;
+	esac
 	if [ "$prime_agent_base_url" = "$prime_agent_unconfigured_base_url" ]; then
 		printf 'error: installer download URL is not configured.\n' >&2
 		printf 'Set PRIME_AGENT_DOWNLOAD_BASE_URL or use the installer published by the release workflow.\n' >&2
@@ -104,7 +126,11 @@ prime_agent_install_node() {
 	if [ "$prime_agent_screen_enabled" = 1 ]; then
 		prime_agent_screen "Installing Prime Agent" "" "" ""
 	else
-		printf '\n\033[1m  Installing Prime Agent\033[0m\n\033[2m  npm global install\033[0m\n\n'
+		if [ "${PRIME_AGENT_TEAM_VERIFIED_INSTALL:-0}" = 1 ]; then
+			printf '\n\033[1m  Installing Prime Agent Team\033[0m\n\033[2m  npm private prefix install\033[0m\n\n'
+		else
+			printf '\n\033[1m  Installing Prime Agent\033[0m\n\033[2m  npm global install\033[0m\n\n'
+		fi
 	fi
 
 	start_preflight_checks
@@ -134,7 +160,7 @@ prime_agent_install_node() {
 
 	version="$(resolve_prime_agent_version "$@")"
 	tarball_name="$prime_agent_package-$version.tgz"
-	tarball_url="$prime_agent_base_url/releases/v$version/$tarball_name"
+	tarball_url=$(prime_agent_release_url "$version" "$tarball_name")
 
 	confirm_install "$version" "$tarball_url"
 	confirm_kernel_runtime_setup
@@ -144,7 +170,12 @@ prime_agent_install_node() {
 	tarball_path="$download_dir/$tarball_name"
 
 	download_prime_agent_package "$version" "$tarball_url" "$tarball_path"
-	install_prime_agent_package "$tarball_path"
+	if [ "${PRIME_AGENT_TEAM_VERIFIED_INSTALL:-0}" = 1 ]; then
+		prime_agent_download_team_dependencies "$version" "$download_dir"
+		prime_agent_install_verified_team "$version" "$download_dir"
+	else
+		install_prime_agent_package "$tarball_path"
+	fi
 	rm -rf "$download_dir"
 	prime_agent_download_dir=
 
@@ -1050,13 +1081,21 @@ resolve_prime_agent_version() {
 normalize_version() {
 	version="${1#v}"
 	case "$version" in
-		"")
-			printf 'error: empty Prime Agent version.\n' >&2
-			exit 1
-			;;
-		*[!0-9A-Za-z.-]*)
+		""|.*|*.|*..*|*[!0-9A-Za-z.+-]*)
 			printf 'error: invalid Prime Agent version: %s\n' "$1" >&2
 			exit 1
+			;;
+	esac
+	case "$version" in
+		*+*)
+			version_base=${version%%+*}
+			version_build=${version#*+}
+			case "$version_base:$version_build" in
+				:*|*.:*|*:|*:.*|*+*)
+					printf 'error: invalid Prime Agent version: %s\n' "$1" >&2
+					exit 1
+					;;
+			esac
 			;;
 	esac
 	printf '%s' "$version"
@@ -1526,13 +1565,25 @@ prime_agent_source_profile_command() {
 	printf '. %s && %s' "$(prime_agent_shell_quote "$1")" "$prime_agent_cmd"
 }
 
+prime_agent_release_url() {
+	release_version="$1"
+	release_file="$2"
+	if [ "${PRIME_AGENT_RELEASE_LAYOUT:-standard}" = github ]; then
+		encoded_version=$(printf '%s' "$release_version" | sed 's/+/%2B/g')
+		encoded_file=$(printf '%s' "$release_file" | sed 's/+/%2B/g')
+		printf '%s/releases/download/team-v%s/%s' "$prime_agent_base_url" "$encoded_version" "$encoded_file"
+	else
+		printf '%s/releases/v%s/%s' "$prime_agent_base_url" "$release_version" "$release_file"
+	fi
+}
+
 download_prime_agent_package() {
 	version="$1"
 	tarball_url="$2"
 	tarball_path="$3"
 	download_dir=$(dirname "$tarball_path")
 	tarball_name=$(basename "$tarball_path")
-	checksums_url="$prime_agent_base_url/releases/v$version/SHA256SUMS"
+	checksums_url=$(prime_agent_release_url "$version" SHA256SUMS)
 	checksums_path="$download_dir/SHA256SUMS"
 
 	if ! command -v curl >/dev/null 2>&1; then
@@ -1562,9 +1613,9 @@ verify_prime_agent_package_checksum() {
 	tarball_name=$(basename "$tarball_path")
 	selected_checksums_path="$checksum_dir/SHA256SUMS.selected"
 
-	if ! awk -v file="$tarball_name" '$2 == file { print; found = 1; exit } END { if (!found) exit 1 }' \
+	if ! awk -v file="$tarball_name" '$2 == file { line = $0; count++ } END { if (count != 1) exit 1; print line }' \
 		"$checksums_path" >"$selected_checksums_path"; then
-		printf 'error: checksum for %s was not found in %s\n' "$tarball_name" "$checksums_path" >&2
+		printf 'error: expected exactly one checksum for %s in %s\n' "$tarball_name" "$checksums_path" >&2
 		exit 1
 	fi
 
@@ -1586,6 +1637,69 @@ verify_prime_agent_package_checksum() {
 	fi
 }
 
+prime_agent_download_team_dependencies() {
+	team_version="$1"
+	team_download_dir="$2"
+	for team_package in ai core tui; do
+		team_file="prime-agent-$team_package-$team_version.tgz"
+		team_path="$team_download_dir/$team_file"
+		team_url=$(prime_agent_release_url "$team_version" "$team_file")
+		prime_agent_run_quiet_with_animation \
+			"Downloading Team dependency" \
+			"Downloading Team dependency" \
+			"Fetching $team_file." \
+			prime_agent_curl_download -fsSL "$team_url" -o "$team_path"
+		verify_prime_agent_package_checksum "$team_download_dir/SHA256SUMS" "$team_path"
+	done
+	chmod 400 "$team_download_dir/prime-agent-team-$team_version.tgz" \
+		"$team_download_dir/prime-agent-ai-$team_version.tgz" \
+		"$team_download_dir/prime-agent-core-$team_version.tgz" \
+		"$team_download_dir/prime-agent-tui-$team_version.tgz"
+}
+
+prime_agent_install_verified_team() {
+	team_version="$1"
+	team_download_dir="$2"
+	team_prefix="${npm_config_prefix:-}"
+	if [ "$prime_agent_package" != prime-agent-team ] || [ "$prime_agent_cmd" != prime-agent-team ] ||
+		[ "$team_prefix" != "$HOME/.local/share/prime-agent-team" ]; then
+		printf 'error: verified Team install requires the private Team npm prefix.\n' >&2
+		exit 1
+	fi
+	team_project="$team_prefix/lib"
+	mkdir -p "$team_project" "$team_prefix/bin"
+	node - "$team_project/package.json" "$team_download_dir" "$team_version" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [manifest, directory, version] = process.argv.slice(2);
+try {
+  const stat = fs.lstatSync(manifest);
+  if (!stat.isFile() || stat.isSymbolicLink() || JSON.parse(fs.readFileSync(manifest, "utf8")).primeAgentTeamInstaller !== 1) {
+    throw new Error(`Refusing to overwrite unmanaged ${manifest}; inspect it manually.`);
+  }
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
+const tarball = (name) => `file:${path.join(directory, `prime-agent-${name}-${version}.tgz`)}`;
+fs.writeFileSync(manifest, JSON.stringify({
+  name: "prime-agent-team-install", version: "0.0.0", private: true, primeAgentTeamInstaller: 1,
+  dependencies: { "prime-agent-team": tarball("team") },
+  allowScripts: { "prime-agent-team": true },
+  overrides: {
+    "@earendil-works/pi-ai": tarball("ai"),
+    "@earendil-works/pi-agent-core": tarball("core"),
+    "@earendil-works/pi-tui": tarball("tui"),
+  },
+}, null, 2) + "\n");
+NODE
+	if prime_agent_npm_requires_remote_policy; then
+		(cd "$team_project" && env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 npm install --prefix "$team_project" --no-fund --no-audit --loglevel=error --progress=false \
+			--allow-remote=all)
+	else
+		(cd "$team_project" && env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 npm install --prefix "$team_project" --no-fund --no-audit --loglevel=error --progress=false)
+	fi
+}
+
 prime_agent_run_checksum_check() {
 	checksum_dir="$1"
 	selected_checksums_name="$2"
@@ -1604,9 +1718,16 @@ confirm_install() {
 	version="$1"
 	tarball_url="$2"
 
+	if [ "${PRIME_AGENT_TEAM_VERIFIED_INSTALL:-0}" = 1 ]; then
+		confirm_question="Install Prime Agent Team v$version in its private prefix?"
+		confirm_detail="Downloads and verifies the four Team release packages."
+	else
+		confirm_question="Install Prime Agent v$version globally with npm?"
+		confirm_detail="Downloads the checksummed release and runs npm install -g."
+	fi
 	if prime_agent_prompt_yes_no \
-		"Install Prime Agent v$version globally with npm?" \
-		"Downloads the checksummed release and runs npm install -g." \
+		"$confirm_question" \
+		"$confirm_detail" \
 		"Install? [Y/n]"; then
 		return 0
 	else
