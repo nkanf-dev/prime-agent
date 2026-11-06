@@ -899,6 +899,11 @@ export class DaemonSupervisor {
 			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
 			mkdirSync(this.snapshotCacheRoot, { recursive: true, mode: 0o700 });
 			if (this.nativeMeshConfig) {
+				if (process.platform === "win32") {
+					this.log(
+						"Native mesh on Windows cannot fsync directories; power-loss durability of journal entries is not guaranteed",
+					);
+				}
 				// Audit attribution is self-declared, not proof of individual identity.
 				const host = this.nativeMeshConfig.machineId;
 				const machineId = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(host)

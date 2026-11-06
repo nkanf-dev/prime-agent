@@ -29,6 +29,10 @@ export interface NativeMeshOutboxItem {
 type Store = Pick<NativeMeshTransport, "store">;
 
 function syncDirectory(path: string): void {
+	// Node cannot fsync a directory on Windows (EPERM). File contents are still
+	// fsynced before publication, but power-loss durability of directory entries
+	// is not guaranteed on Windows. Do not suppress Unix errors.
+	if (process.platform === "win32") return;
 	const fd = openSync(path, "r");
 	try {
 		fsyncSync(fd);

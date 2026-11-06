@@ -1,10 +1,13 @@
+import * as fs from "node:fs";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeMeshOperations } from "../src/modes/daemon/native-mesh/operations.js";
 import { NativeMeshOutbox } from "../src/modes/daemon/native-mesh/outbox.js";
 import { nativeMeshAgentId, nativeMeshRequestId } from "../src/modes/daemon/native-mesh/transport.js";
+
+vi.mock("node:fs", { spy: true });
 
 const directories: string[] = [];
 function directory(): string {
@@ -21,6 +24,66 @@ const other = nativeMeshAgentId("host-c", "three");
 const input = { from, to, text: " exact text \n", operationId: "caller-operation" };
 
 describe("native mesh durable operation bindings", () => {
+	it("can publish and recover operation and outbox records with Windows directory sync unavailable", () => {
+		const dir = directory();
+		const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+		const sync = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+			if (fs.fstatSync(fd).isDirectory())
+				throw Object.assign(new Error("directory fsync unsupported"), { code: "EPERM" });
+		});
+		try {
+			Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+			const journal = new NativeMeshOperations(join(dir, "operations"));
+			const box = new NativeMeshOutbox(join(dir, "outbox"), {
+				store: async (item) => ({
+					requestId: nativeMeshRequestId(item.from, item.callerMessageId),
+					deliveryStatus: "stored",
+				}),
+			});
+			const id = journal.bind(input);
+			expect(box.enqueue({ from, to, text: input.text, callerMessageId: input.operationId })).toBe(id);
+			expect(new NativeMeshOperations(join(dir, "operations")).get(from, input.operationId)).toEqual({
+				version: 1,
+				...input,
+			});
+			expect(
+				new NativeMeshOutbox(join(dir, "outbox"), {
+					store: async () => {
+						throw new Error("not called");
+					},
+				}).pending(),
+			).toEqual([id]);
+			journal.markStored(id);
+			expect(journal.pending()).toEqual([]);
+			expect(sync.mock.calls.length).toBeGreaterThanOrEqual(3);
+		} finally {
+			sync.mockRestore();
+			Object.defineProperty(process, "platform", platform);
+		}
+	});
+
+	it("propagates directory fsync failures on Unix", () => {
+		const dir = directory();
+		const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+		const sync = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+			if (fs.fstatSync(fd).isDirectory()) throw Object.assign(new Error("directory sync failed"), { code: "EIO" });
+		});
+		try {
+			Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+			expect(() => new NativeMeshOperations(join(dir, "operations"))).toThrow("directory sync failed");
+			expect(
+				() =>
+					new NativeMeshOutbox(join(dir, "outbox"), {
+						store: async () => {
+							throw new Error("not called");
+						},
+					}),
+			).toThrow("directory sync failed");
+		} finally {
+			sync.mockRestore();
+			Object.defineProperty(process, "platform", platform);
+		}
+	});
 	it("binds duplicate calls and preserves exact payload across restarts", () => {
 		const dir = join(directory(), "nested", "operations");
 		const first = new NativeMeshOperations(dir);
