@@ -59,38 +59,29 @@ if child is not None:
   neither `deliveredAt` nor `queuedAt`. A storage-outcome-unknown error must not be
   retried automatically: a resend can show the message twice.
 
-## Retrying native mesh sends
+## Native mesh operation safety
 
-For a direct native mesh send, supply `operation_id` to identify the logical
-message. It must be a nonblank string, contain no ASCII control characters, and
-be at most 128 UTF-8 bytes. Broadcasts do not accept an operation ID.
+For each direct native mesh send, generate and retain a unique `operation_id`
+before calling the official `agent_message.send`. The ID must be nonblank,
+contain no ASCII control characters, and be at most 128 UTF-8 bytes. Use it only
+for that exact logical message, target and text. Broadcasts, local sends and
+Cotal sends do not accept this parameter; omitting it preserves existing send behavior. If the
+outcome is unknown, first inspect or reconcile the original operation through a
+documented, supported interface. A controlled retry of the same logical send is
+permitted only under the official contract when the broker's durable
+deduplication still applies, the target and payload are exactly unchanged, and
+the same operation ID is used. Never blindly resend, change target or operation
+ID, or automatically replay an old session or quarantined record. If these
+conditions cannot be established, do not retry. Report any unresolved outcome
+as unknown.
 
-Generate and retain the ID **before** sending, so it is available even if the
-whole response is lost. If the outcome is unknown, retry the same message to
-the same target with the same ID. Use a new ID for every independent message;
-do not reuse an ID with a different target or text. For example:
+Do not directly write, modify, forge or simulate native journal, outbox or
+marker files (including `native-mesh-operations`). Never manually construct an
+`nm1m` filename or use a custom helper to bypass the official API.
 
-```python
-from uuid import uuid4
-
-operation_id = str(uuid4())  # Save before sending; reuse only for this message.
-receipt = await agent_message.send(
-    "Please inspect the latest result.",
-    receiver_role="child",
-    receiver_name=child.session_name,
-    operation_id=operation_id,
-)
-# If the outcome is unknown, retry the same call with this operation_id.
-```
-
-A retry may temporarily fail during roster resolution while the target is
-offline, even if the durable outbox continues retrying the original operation.
-When the target reappears, retry with the same ID, target, and text.
-
-`operation_id` is accepted only for native mesh sends. Local and Cotal sends
-reject it; they do not ignore it. This does not change Cotal's
-storage-outcome-unknown warning above. Omitting `operation_id` preserves the
-existing send behavior.
+These instructions are advisory, not a security boundary. They cannot replace
+OS identity isolation or daemon-side authentication, authorization and
+protection of native message state.
 
 ## Safety
 
