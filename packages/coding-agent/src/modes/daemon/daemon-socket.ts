@@ -1,4 +1,5 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -6,6 +7,10 @@ import lockfile from "proper-lockfile";
 
 export { normalizeSocketPath } from "../../utils/daemon-socket-path.js";
 
+// Darwin's sockaddr_un.sun_path is 104 bytes including the terminating NUL.
+// Reserve enough space for the longest generated worker name on all Unix systems.
+const PORTABLE_UNIX_SOCKET_PATH_BYTES = 103;
+const WORKER_SOCKET_NAME = `worker-${"f".repeat(12)}-${"f".repeat(12)}.sock`;
 const DAEMON_SOCKET_MODE = 0o600;
 const DAEMON_SOCKET_DIR_MODE = 0o700;
 const DAEMON_SOCKET_RELEASE_GRACE_MS = 1000;
@@ -75,6 +80,7 @@ export function defaultDaemonSocketPath(): string {
 }
 
 export async function acquireDaemonSocketPathLease(socketPath: string): Promise<DaemonSocketPathLease | undefined> {
+	validateDaemonSocketPath(socketPath);
 	ensureDefaultDaemonSocketDir(socketPath);
 	if (process.platform === "win32") {
 		return undefined;
@@ -102,6 +108,7 @@ export async function acquireDaemonSocketPathLease(socketPath: string): Promise<
 }
 
 export async function prepareDaemonSocketPath(socketPath: string, lease?: DaemonSocketPathLease): Promise<void> {
+	validateDaemonSocketPath(socketPath);
 	ensureDefaultDaemonSocketDir(socketPath);
 
 	if (process.platform === "win32") {
@@ -278,7 +285,28 @@ function assertSocketLeaseHeld(socketPath: string, lease: DaemonSocketPathLease)
 
 export function defaultDaemonSocketDir(): string {
 	const suffix = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-	return join(tmpdir(), `prime-agent-team-${suffix}`);
+	const temporaryDir = tmpdir();
+	const preferred = join(temporaryDir, `prime-agent-team-${suffix}`);
+	if (
+		process.platform === "win32" ||
+		Buffer.byteLength(join(preferred, WORKER_SOCKET_NAME)) <= PORTABLE_UNIX_SOCKET_PATH_BYTES
+	) {
+		return preferred;
+	}
+	// Preserve isolation between different TMPDIR values as well as different users.
+	// The directory is created and checked by ensureDefaultDaemonSocketDir before use.
+	const key = createHash("sha256").update(temporaryDir).digest("hex").slice(0, 12);
+	return join("/tmp", `prime-agent-team-${suffix}-${key}`);
+}
+
+function validateDaemonSocketPath(socketPath: string): void {
+	if (process.platform === "win32") return;
+	const maxBytes = process.platform === "linux" ? 107 : PORTABLE_UNIX_SOCKET_PATH_BYTES;
+	if (Buffer.byteLength(socketPath) > maxBytes) {
+		throw new Error(
+			`Daemon socket path is too long (${Buffer.byteLength(socketPath)} bytes; maximum ${maxBytes}): ${socketPath}`,
+		);
+	}
 }
 
 function ensureDefaultDaemonSocketDir(socketPath: string): void {
@@ -286,6 +314,10 @@ function ensureDefaultDaemonSocketDir(socketPath: string): void {
 		return;
 	}
 
+	const suffix = typeof process.getuid === "function" ? String(process.getuid()) : "user";
+	if (defaultDaemonSocketDir() !== join(tmpdir(), `prime-agent-team-${suffix}`)) {
+		assertSafeFallbackParent();
+	}
 	if (!existsSync(defaultDaemonSocketDir())) {
 		mkdirSync(defaultDaemonSocketDir(), { recursive: true, mode: DAEMON_SOCKET_DIR_MODE });
 	}
@@ -300,6 +332,22 @@ function ensureDefaultDaemonSocketDir(socketPath: string): void {
 	}
 
 	chmodSync(defaultDaemonSocketDir(), DAEMON_SOCKET_DIR_MODE);
+}
+
+function assertSafeFallbackParent(): void {
+	// /tmp is normally a root-owned directory; on macOS it is a root-owned
+	// symlink to /private/tmp. Do not create a private directory under an
+	// untrusted or non-sticky shared parent.
+	const link = lstatSync("/tmp");
+	const target = lstatSync(realpathSync("/tmp"));
+	if (
+		link.uid !== 0 ||
+		target.uid !== 0 ||
+		!target.isDirectory() ||
+		((target.mode & 0o022) !== 0 && (target.mode & 0o1000) === 0)
+	) {
+		throw new Error("Unsafe daemon socket fallback parent: /tmp must be root-owned and sticky when shared");
+	}
 }
 
 function canConnectToUnixSocket(socketPath: string): Promise<boolean> {

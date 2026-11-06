@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { ENV_SESSION_DIR } from "../config.js";
@@ -82,6 +83,10 @@ export function repositorySocketPath(root: string): string {
 	for (const byte of bytes) update(byte);
 	for (let length = bytes.length; length > 0; length = Math.floor(length / 256)) update(length & 255);
 	const sum = String(~crc >>> 0);
+	if (process.platform === "win32") {
+		const key = createHash("sha256").update(root).digest("hex").slice(0, 32);
+		return `\\\\.\\pipe\\prime-agent-repo-${key}`;
+	}
 	const prefix = defaultDaemonSocketDir();
 	const name = basename(root)
 		.replace(/^\./, "")

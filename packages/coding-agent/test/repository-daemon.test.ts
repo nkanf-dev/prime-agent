@@ -17,6 +17,19 @@ import * as childProcess from "../src/utils/child-process.js";
 
 vi.mock("node:child_process", { spy: true });
 
+it("uses a stable named pipe for repository sockets on Windows", () => {
+	const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+	try {
+		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+		const first = repositorySocketPath("C:\\repo");
+		expect(first).toMatch(/^\\\\\.\\pipe\\prime-agent-repo-[0-9a-f]{32}$/);
+		expect(repositorySocketPath("C:\\repo")).toBe(first);
+		expect(repositorySocketPath("C:\\other")).not.toBe(first);
+	} finally {
+		Object.defineProperty(process, "platform", original);
+	}
+});
+
 it.each([
 	"repo",
 	"subfolder",

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import {
 	cleanupDaemonSocketPath,
 	DaemonSocketPathLease,
+	defaultDaemonSocketDir,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
 	normalizeSocketPath,
@@ -40,6 +41,132 @@ describe("defaultDaemonSocketPath", () => {
 
 		expect(dirname(socketPath)).toBe(join(tmpdir(), `prime-agent-team-${suffix}`));
 		expect(basename(socketPath)).toBe("daemon.sock");
+	});
+
+	it("switches directories only when the longest worker path exceeds 103 UTF-8 bytes", () => {
+		if (process.platform === "win32") {
+			expect(defaultDaemonSocketPath()).toBe("\\\\.\\pipe\\prime-agent-team-daemon");
+		} else {
+			const original = process.env.TMPDIR;
+			const suffix = typeof process.getuid === "function" ? String(process.getuid()) : "user";
+			const worker = `worker-${"f".repeat(12)}-${"f".repeat(12)}.sock`;
+			const base = "/tmp/";
+			const fixed = Buffer.byteLength(join(base, `prime-agent-team-${suffix}`, worker));
+			try {
+				process.env.TMPDIR = base + "x".repeat(102 - fixed);
+				const preferred = join(process.env.TMPDIR, `prime-agent-team-${suffix}`);
+				expect(Buffer.byteLength(join(preferred, worker))).toBe(103);
+				expect(defaultDaemonSocketDir()).toBe(preferred);
+				process.env.TMPDIR += "é";
+				expect(defaultDaemonSocketDir()).not.toBe(join(process.env.TMPDIR, `prime-agent-team-${suffix}`));
+				expect(Buffer.byteLength(join(defaultDaemonSocketDir(), worker))).toBeLessThanOrEqual(103);
+			} finally {
+				if (original === undefined) delete process.env.TMPDIR;
+				else process.env.TMPDIR = original;
+			}
+		}
+	});
+
+	it("uses a short private per-user directory when TMPDIR cannot fit a worker socket", async () => {
+		if (process.platform === "win32") {
+			expect(defaultDaemonSocketPath()).toBe("\\\\.\\pipe\\prime-agent-team-daemon");
+		} else {
+			const original = process.env.TMPDIR;
+			const unique = mkdtempSync("/tmp/pa-long-");
+			process.env.TMPDIR = join(unique, "界".repeat(40));
+			const directory = defaultDaemonSocketDir();
+			let created = false;
+			try {
+				expect(directory).toBe(defaultDaemonSocketDir());
+				expect(directory).toMatch(/^\/tmp\/prime-agent-team-/);
+				expect(
+					Buffer.byteLength(join(directory, `worker-${"f".repeat(12)}-${"f".repeat(12)}.sock`)),
+				).toBeLessThanOrEqual(103);
+				expect(existsSync(directory)).toBe(false);
+				await prepareDaemonSocketPath(join(directory, "daemon.sock"));
+				created = true;
+				expect(lstatSync(directory).mode & 0o777).toBe(0o700);
+				chmodSync(directory, 0o755);
+				await prepareDaemonSocketPath(join(directory, "daemon.sock"));
+				expect(lstatSync(directory).mode & 0o777).toBe(0o700);
+				process.env.TMPDIR += "different";
+				expect(defaultDaemonSocketDir()).not.toBe(directory);
+			} finally {
+				if (original === undefined) delete process.env.TMPDIR;
+				else process.env.TMPDIR = original;
+				if (created) rmSync(directory, { recursive: true, force: true });
+				rmSync(unique, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("rejects a symlink at the fallback directory without changing its target", async () => {
+		if (process.platform === "win32") {
+			expect(defaultDaemonSocketPath()).toBe("\\\\.\\pipe\\prime-agent-team-daemon");
+		} else {
+			const original = process.env.TMPDIR;
+			const unique = mkdtempSync("/tmp/pa-link-");
+			process.env.TMPDIR = join(unique, "x".repeat(120));
+			const directory = defaultDaemonSocketDir();
+			const target = join(unique, "target");
+			let linked = false;
+			try {
+				mkdirSync(target, { mode: 0o755 });
+				chmodSync(target, 0o755);
+				expect(existsSync(directory)).toBe(false);
+				symlinkSync(target, directory);
+				linked = true;
+				await expect(prepareDaemonSocketPath(join(directory, "daemon.sock"))).rejects.toThrow(/not a directory/);
+				expect(lstatSync(target).mode & 0o777).toBe(0o755);
+			} finally {
+				if (original === undefined) delete process.env.TMPDIR;
+				else process.env.TMPDIR = original;
+				if (linked) unlinkSync(directory);
+				rmSync(unique, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("isolates users and rejects a fallback directory owned by a different UID", async () => {
+		if (process.platform === "win32") {
+			expect(defaultDaemonSocketPath()).toBe("\\\\.\\pipe\\prime-agent-team-daemon");
+		} else {
+			const originalTmp = process.env.TMPDIR;
+			const originalUid = Object.getOwnPropertyDescriptor(process, "getuid")!;
+			const unique = mkdtempSync("/tmp/pa-owner-");
+			let directory = "";
+			let created = false;
+			try {
+				process.env.TMPDIR = join(unique, "x".repeat(120));
+				const current = defaultDaemonSocketDir();
+				const uid = process.getuid!();
+				Object.defineProperty(process, "getuid", { ...originalUid, value: () => uid + 1 });
+				directory = defaultDaemonSocketDir();
+				expect(directory).not.toBe(current);
+				expect(existsSync(directory)).toBe(false);
+				mkdirSync(directory, { mode: 0o700 });
+				created = true;
+				await expect(prepareDaemonSocketPath(join(directory, "daemon.sock"))).rejects.toThrow(
+					/not owned by the current user/,
+				);
+			} finally {
+				Object.defineProperty(process, "getuid", originalUid);
+				if (originalTmp === undefined) delete process.env.TMPDIR;
+				else process.env.TMPDIR = originalTmp;
+				if (created) rmSync(directory, { recursive: true, force: true });
+				rmSync(unique, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("rejects an explicitly selected overlong socket instead of relocating it", async () => {
+		if (process.platform === "win32") {
+			expect(defaultDaemonSocketPath()).toBe("\\\\.\\pipe\\prime-agent-team-daemon");
+		} else {
+			const path = `/tmp/${"界".repeat(40)}.sock`;
+			await expect(prepareDaemonSocketPath(path)).rejects.toThrow(/socket path is too long/i);
+			expect(existsSync(path)).toBe(false);
+		}
 	});
 
 	it("checks a live daemon before acquiring the socket path lock", async () => {
