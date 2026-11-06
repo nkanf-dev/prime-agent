@@ -6,7 +6,6 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
-	renameSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -54,12 +53,12 @@ describe("Team configuration bootstrap", () => {
 			defaultModel: "x",
 			skills: ["/my/skill"],
 		});
-		expect(readFileSync(join(target, "auth.json"), "utf8")).toContain(secret);
+		expect(existsSync(join(target, "auth.json"))).toBe(false);
 		expect(existsSync(join(target, "daemon.sock"))).toBe(false);
 		expect(existsSync(join(target, "session.json"))).toBe(false);
 		if (process.platform !== "win32") {
 			expect(lstatSync(target).mode & 0o777).toBe(0o700);
-			expect(lstatSync(join(target, "auth.json")).mode & 0o777).toBe(0o600);
+			expect(lstatSync(join(target, "models.json")).mode & 0o777).toBe(0o600);
 		}
 		writeFileSync(join(target, "settings.json"), "{}");
 		bootstrapTeamConfig(dir);
@@ -73,10 +72,33 @@ describe("Team configuration bootstrap", () => {
 		bootstrapTeamConfig(dir);
 		expect(readFileSync(join(dir, ".prime-team", "agent", "settings.json"), "utf8")).toBe("{}");
 	});
+	test("configured startup validates files without acquiring a marker", () => {
+		const dir = home();
+		upstream(dir, "settings.json", "{}");
+		bootstrapTeamConfig(dir);
+		const script = `
+			import fs from "node:fs";
+			import { syncBuiltinESMExports } from "node:module";
+			const open = fs.openSync;
+			fs.openSync = function(path, flags, ...args) {
+				if (String(path).endsWith(".team-bootstrap-incomplete") && flags === "wx") process.exit(3);
+				return open.call(this, path, flags, ...args);
+			};
+			syncBuiltinESMExports();
+			const { bootstrapTeamConfig } = await import("./src/team-bootstrap.ts");
+			bootstrapTeamConfig(process.env.HOME);
+		`;
+		const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+			cwd: process.cwd(),
+			env: { ...process.env, HOME: dir, USERPROFILE: dir, TMPDIR: dir },
+			encoding: "utf8",
+		});
+		expect(result.status, result.stderr).toBe(0);
+	});
 	test("malformed source fails before target creation without disclosing contents", () => {
 		const dir = home();
-		upstream(dir, "auth.json", "SECRET-INVALID-");
-		expect(() => bootstrapTeamConfig(dir)).toThrow(/auth.json/);
+		upstream(dir, "settings.json", "SECRET-INVALID-");
+		expect(() => bootstrapTeamConfig(dir)).toThrow(/settings.json/);
 		try {
 			bootstrapTeamConfig(dir);
 		} catch (error) {
@@ -88,7 +110,7 @@ describe("Team configuration bootstrap", () => {
 	test.skipIf(process.platform === "win32")("refuses source and target symlinks", () => {
 		const dir = home();
 		upstream(dir, "settings.json", "{}");
-		const src = join(dir, ".prime", "agent", "auth.json");
+		const src = join(dir, ".prime", "agent", "models.json");
 		symlinkSync(join(dir, ".prime", "agent", "settings.json"), src);
 		expect(() => bootstrapTeamConfig(dir)).toThrow();
 		rmSync(src);
@@ -113,12 +135,8 @@ describe("Team configuration bootstrap", () => {
 			expect(readFileSync(join(target, "auth.json"), "utf8")).toBe("{}");
 			expect(warning).not.toHaveBeenCalled();
 			expect(warning.mock.calls.flat().join(" ")).not.toContain("SECRET_SOURCE_482");
-			renameSync(join(target, "auth.json"), join(target, "auth.backup.json"));
 			bootstrapTeamConfig(dir);
-			expect(JSON.parse(readFileSync(join(target, "auth.json"), "utf8"))).toEqual({
-				source: { type: "api_key", key: "SECRET_SOURCE_482" },
-			});
-			expect(readFileSync(join(target, "auth.backup.json"), "utf8")).toBe("{}");
+			expect(readFileSync(join(target, "auth.json"), "utf8")).toBe("{}");
 		} finally {
 			warning.mockRestore();
 		}
@@ -146,25 +164,27 @@ describe("Team configuration bootstrap", () => {
 	});
 	test("rejects source and destination hard links", () => {
 		const dir = home();
-		upstream(dir, "auth.json", "{}");
-		const src = join(dir, ".prime", "agent", "auth.json");
+		upstream(dir, "settings.json", "{}");
+		const src = join(dir, ".prime", "agent", "settings.json");
 		linkSync(src, join(dir, "source-hardlink"));
 		expect(() => bootstrapTeamConfig(dir)).toThrow();
 		rmSync(join(dir, "source-hardlink"));
 		bootstrapTeamConfig(dir);
 		const dest = join(dir, ".prime-team", "agent", "auth.json");
+		writeFileSync(dest, "{}");
 		linkSync(dest, join(dir, "target-hardlink"));
 		expect(() => bootstrapTeamConfig(dir)).toThrow();
 	});
-	test("competing first launches never overwrite or expose partial files", async () => {
+	test.each([false, true])("competing launches all succeed (already configured: %s)", async (configured) => {
 		const dir = home();
 		upstream(dir, "settings.json", JSON.stringify({ defaultProvider: "test" }));
 		upstream(dir, "auth.json", JSON.stringify({ test: { type: "api_key", key: "SYNTHETIC_CONCURRENT_SECRET" } }));
+		if (configured) bootstrapTeamConfig(dir);
 		const script = `import { bootstrapTeamConfig } from "./src/team-bootstrap.ts"; console.log("ready"); process.stdin.once("data", () => { try { bootstrapTeamConfig(process.env.HOME); } catch { process.exitCode = 1; } });`;
-		const children = [1, 2].map(() =>
-			spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+		const children = Array.from({ length: 16 }, () =>
+			spawn(process.execPath, ["--input-type=module", "-e", script], {
 				cwd: process.cwd(),
-				env: { ...process.env, HOME: dir },
+				env: { ...process.env, HOME: dir, USERPROFILE: dir, TMPDIR: dir },
 				stdio: ["pipe", "pipe", "pipe"],
 			}),
 		);
@@ -198,17 +218,50 @@ describe("Team configuration bootstrap", () => {
 				child.stdin.end("go");
 			});
 			const statuses = await Promise.all(exits);
-			expect(statuses).toContain(0);
-			expect(statuses.every((status) => status === 0 || status === 1)).toBe(true);
+			expect(statuses).toEqual(children.map(() => 0));
 			bootstrapTeamConfig(dir);
-			expect(JSON.parse(readFileSync(join(dir, ".prime-team", "agent", "auth.json"), "utf8"))).toEqual({
-				test: { type: "api_key", key: "SYNTHETIC_CONCURRENT_SECRET" },
+			expect(existsSync(join(dir, ".prime-team", "agent", "auth.json"))).toBe(false);
+			expect(JSON.parse(readFileSync(join(dir, ".prime-team", "agent", "settings.json"), "utf8"))).toEqual({
+				defaultProvider: "test",
 			});
 			expect(outputs.join("")).not.toContain("SYNTHETIC_CONCURRENT_SECRET");
 		} finally {
 			children.forEach((child) => {
 				child.kill();
 			});
+		}
+	});
+
+	test("waits for a live marker owner without removing its marker", async () => {
+		const dir = home();
+		upstream(dir, "settings.json", "{}");
+		mkdirSync(join(dir, ".prime-team"));
+		const marker = join(dir, ".prime-team", ".team-bootstrap-incomplete");
+		const script = `
+			const fs = require("node:fs");
+			fs.writeFileSync(process.argv[1], "owner", { flag: "wx" });
+			console.log("ready");
+			setTimeout(() => {
+				if (fs.readFileSync(process.argv[1], "utf8") !== "owner") process.exit(2);
+				fs.unlinkSync(process.argv[1]);
+			}, 500);
+		`;
+		const child = spawn(process.execPath, ["-e", script, marker], { stdio: ["ignore", "pipe", "pipe"] });
+		try {
+			const exited = new Promise<number | null>((resolve, reject) => {
+				child.once("error", reject);
+				child.once("exit", resolve);
+			});
+			await new Promise<void>((resolve, reject) => {
+				child.stdout.once("data", () => resolve());
+				child.once("error", reject);
+				child.once("exit", () => reject(new Error("marker owner exited before ready")));
+			});
+			bootstrapTeamConfig(dir);
+			expect(await exited).toBe(0);
+			expect(readFileSync(join(dir, ".prime-team", "agent", "settings.json"), "utf8")).toBe("{}");
+		} finally {
+			child.kill();
 		}
 	});
 
@@ -219,7 +272,14 @@ describe("Team configuration bootstrap", () => {
 		const marker = join(dir, ".prime-team", ".team-bootstrap-incomplete");
 		upstream(dir, "settings.json", JSON.stringify({ defaultProvider: "recovered" }));
 		writeFileSync(marker, "");
-		expect(() => bootstrapTeamConfig(dir)).toThrow(/interrupted/);
+		// Advance the deadline without making the test wait for the real recovery timeout.
+		const now = vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(10_000);
+		try {
+			expect(() => bootstrapTeamConfig(dir)).toThrow(/interrupted/);
+			expect(existsSync(marker)).toBe(true);
+		} finally {
+			now.mockRestore();
+		}
 		rmSync(marker);
 		bootstrapTeamConfig(dir);
 		expect(JSON.parse(readFileSync(join(dest, "settings.json"), "utf8"))).toEqual({ defaultProvider: "recovered" });
@@ -287,7 +347,7 @@ describe("Team configuration bootstrap", () => {
             if (!ok) process.exit(2);
         `;
 		const checked = run(["--input-type=module", "-e", probe], { EXPECTED_TEST_KEY: secret });
-		expect(checked.status).toBe(0);
+		expect(checked.status, `${checked.stdout}${checked.stderr}`.replaceAll(secret, "[redacted]")).toBe(0);
 		expect(`${checked.stdout}${checked.stderr}`).not.toContain(secret);
 	});
 	test("CLI restart preserves Team config and explicit override bypasses import", () => {

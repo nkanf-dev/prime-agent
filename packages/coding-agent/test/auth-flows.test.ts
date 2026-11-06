@@ -299,6 +299,68 @@ describe("ProviderAuthFlows", () => {
 		expect(statusMessages.join("\n")).toContain("Logged out of acme-2");
 	});
 
+	it.each(["overlay-only", "local-and-upstream"])(
+		"blocks upstream on %s logout and clears it on Team login",
+		async (scenario) => {
+			process.env.HOME = tempDir;
+			vi.stubEnv(ENV_AGENT_DIR, "");
+			const source = join(tempDir, ".prime", "agent", "auth.json");
+			const target = join(tempDir, ".prime-team", "agent", "auth.json");
+			mkdirSync(join(tempDir, ".prime", "agent"), { recursive: true });
+			mkdirSync(join(tempDir, ".prime-team", "agent"), { recursive: true });
+			const main = JSON.stringify({
+				"test-vendor": { type: "api_key", key: "FAKE_MAIN_KEY" },
+				"other-vendor": { type: "api_key", key: "FAKE_OTHER_KEY" },
+			});
+			writeFileSync(source, main);
+			writeFileSync(
+				target,
+				scenario === "overlay-only"
+					? "{}"
+					: JSON.stringify({ "test-vendor": { type: "api_key", key: "FAKE_LOCAL_KEY" } }),
+			);
+			const auth = AuthStorage.create(target);
+			const { host, panels, statusMessages, errorMessages } = createHost(auth);
+			const flows = new ProviderAuthFlows(host);
+			const logout = flows.runLogout();
+			expect(panels).toHaveLength(1);
+			for (const char of "test-vendor") panels[0]?.handleInput?.(char);
+			panels[0]?.handleInput?.("\r");
+			await expect(logout).resolves.toBe("test-vendor");
+			expect(errorMessages).toEqual([]);
+			expect(statusMessages.join(" ")).toContain("blocked upstream fallback");
+			const restarted = AuthStorage.create(target);
+			expect(await restarted.getApiKey("test-vendor")).toBeUndefined();
+			expect(await restarted.getApiKey("other-vendor")).toBe("FAKE_OTHER_KEY");
+			expect(readFileSync(source, "utf8")).toBe(main);
+			const login = flows.loginProvider({ id: "test-vendor", name: "test-vendor", authType: "api_key" });
+			expect(panels).toHaveLength(1);
+			panels[0]?.handleInput?.("FAKE_RELOGIN_KEY");
+			panels[0]?.handleInput?.("\r");
+			await expect(login).resolves.toMatchObject({ status: "success" });
+			expect(await AuthStorage.create(target).getApiKey("test-vendor")).toBe("FAKE_RELOGIN_KEY");
+			expect(readFileSync(source, "utf8")).toBe(main);
+		},
+	);
+
+	it("fails closed without claiming logout when Team suppression metadata is damaged", async () => {
+		process.env.HOME = tempDir;
+		vi.stubEnv(ENV_AGENT_DIR, "");
+		const source = join(tempDir, ".prime", "agent", "auth.json");
+		const target = join(tempDir, ".prime-team", "agent", "auth.json");
+		mkdirSync(join(tempDir, ".prime", "agent"), { recursive: true });
+		mkdirSync(join(tempDir, ".prime-team", "agent"), { recursive: true });
+		const main = JSON.stringify({ example: { type: "api_key", key: "FAKE_MAIN_SECRET" } });
+		writeFileSync(source, main);
+		writeFileSync(target, JSON.stringify({ __prime_agent_team_metadata_v1__: { type: "bad", providers: [] } }));
+		const auth = AuthStorage.create(target);
+		const { host, statusMessages, errorMessages } = createHost(auth);
+		await expect(new ProviderAuthFlows(host).runLogout()).resolves.toBeNull();
+		expect(errorMessages.join(" ")).toContain("cannot read Team auth.json");
+		expect(statusMessages.join(" ")).not.toContain("Logged out");
+		expect(readFileSync(source, "utf8")).toBe(main);
+	});
+
 	it("a failed MCP logout outcome reports the failure honestly instead of success", async () => {
 		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
 		authStorage.set("mcp:acme-2", {

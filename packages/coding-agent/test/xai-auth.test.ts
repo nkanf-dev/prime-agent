@@ -113,7 +113,13 @@ describe("xAI credential source and request model", () => {
 			maxTokens: 512,
 			thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high" },
 		} as Model<Api>;
-		const ids = models.map((model) => model.id);
+		registry.registerProvider("xai", {
+			api: "openai-completions",
+			baseUrl: "https://api.x.ai/v1",
+			apiKey: "XAI_API_KEY",
+			models: [...models, customModel],
+		});
+		const ids = [...models, customModel].map((model) => model.id);
 		for (const credential of [oauth(), { type: "api_key" as const, key: "api-key" }]) {
 			storage.set("xai", credential);
 			expect(

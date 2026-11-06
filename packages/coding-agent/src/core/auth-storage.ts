@@ -17,13 +17,13 @@ import {
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { closeSync, existsSync, fchmodSync, mkdirSync, openSync, readFileSync, writeSync } from "fs";
-import { dirname, join } from "path";
+import { dirname, join, resolve } from "path";
 import lockfile from "proper-lockfile";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, getAgentDir } from "../config.js";
 import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
 import { getPrimeCliConfigPath, PRIME_INFERENCE_PROVIDER_ID, type PrimeTeam } from "./prime-inference-auth.js";
 import { resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
-import { readUpstreamCredential } from "./team-auth-overlay.js";
+import { listUpstreamCredentials, readUpstreamCredential } from "./team-auth-overlay.js";
 
 export type PrimeTeamCredential = {
 	teamId: string;
@@ -67,6 +67,8 @@ export type McpStaticTokenCredential = {
 export type AuthCredential = ApiKeyCredential | OAuthCredential | McpStaticTokenCredential;
 
 export type AuthStorageData = Record<string, AuthCredential>;
+const TEAM_METADATA = "__prime_agent_team_metadata_v1__";
+type TeamMetadata = { type: "team_upstream_suppression"; providers: string[] };
 
 export type AuthStatus = {
 	configured: boolean;
@@ -294,6 +296,7 @@ export class AuthStorage {
 	private staleAuthSources: Map<string, AuthSourceToken[]> = new Map();
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
+	private upstreamReadError?: string;
 	private errors: Error[] = [];
 	private changeListeners = new Set<() => void>();
 
@@ -307,12 +310,17 @@ export class AuthStorage {
 
 	static create(authPath?: string, options?: AuthStorageOptions): AuthStorage {
 		const authOptions = options ?? { usePrimeCliConfig: authPath === undefined };
+		const home = homedir();
+		const expected = resolve(home, ".prime-team", "agent", "auth.json");
+		const actual = authPath === undefined ? expected : resolve(authPath);
+		const isDefaultPath =
+			process.platform === "win32" ? actual.toLowerCase() === expected.toLowerCase() : actual === expected;
 		const upstreamHome =
-			authPath === undefined &&
+			isDefaultPath &&
 			APP_NAME === "prime-agent-team" &&
 			CONFIG_DIR_NAME === ".prime-team/agent" &&
 			!process.env[ENV_AGENT_DIR]
-				? homedir()
+				? home
 				: undefined;
 		return new AuthStorage(
 			new FileAuthStorageBackend(authPath ?? join(getAgentDir(), "auth.json")),
@@ -476,9 +484,73 @@ export class AuthStorage {
 		});
 	}
 
+	private teamSuppressed(data: AuthStorageData = this.data): string[] {
+		const raw: unknown = data[TEAM_METADATA];
+		if (raw === undefined) return [];
+		if (
+			!raw ||
+			typeof raw !== "object" ||
+			(raw as TeamMetadata).type !== "team_upstream_suppression" ||
+			!Array.isArray((raw as TeamMetadata).providers) ||
+			!(raw as TeamMetadata).providers.every((v) => typeof v === "string")
+		)
+			throw new Error("Team auth: invalid suppression metadata; repair Team auth.json before continuing.");
+		return (raw as TeamMetadata).providers;
+	}
+
+	private setTeamSuppressed(data: AuthStorageData, provider: string, value: boolean): void {
+		const providers = new Set(this.teamSuppressed(data));
+		if (value) providers.add(provider);
+		else providers.delete(provider);
+		if (providers.size)
+			(data as unknown as Record<string, unknown>)[TEAM_METADATA] = {
+				type: "team_upstream_suppression",
+				providers: [...providers],
+			};
+		else delete data[TEAM_METADATA];
+	}
+
 	private getUpstreamCredential(provider: string): AuthCredential | undefined {
-		if (!this.upstreamHome || this.loadError || Object.hasOwn(this.data, provider)) return undefined;
-		return readUpstreamCredential(this.upstreamHome, provider);
+		if (
+			!this.upstreamHome ||
+			this.loadError ||
+			Object.hasOwn(this.data, provider) ||
+			this.teamSuppressed().includes(provider)
+		)
+			return undefined;
+		try {
+			const value = readUpstreamCredential(this.upstreamHome, provider);
+			this.upstreamReadError = undefined;
+			return value;
+		} catch {
+			this.upstreamReadError =
+				"Team auth: cannot safely read upstream auth.json; inspect its format, size, permissions, and links.";
+			return undefined;
+		}
+	}
+
+	getUpstreamAuthError(): string | undefined {
+		return this.upstreamReadError;
+	}
+	isUpstreamOverlayEnabled(): boolean {
+		return Boolean(this.upstreamHome);
+	}
+
+	listUpstreamCredentials(): Record<string, AuthCredential> {
+		if (!this.upstreamHome) return {};
+		this.reload();
+		if (this.loadError) throw new Error("Team auth: cannot read Team auth.json; logout was not performed.");
+		try {
+			const values = listUpstreamCredentials(this.upstreamHome);
+			this.upstreamReadError = undefined;
+			for (const provider of Object.keys(values))
+				if (this.teamSuppressed().includes(provider) || Object.hasOwn(this.data, provider)) delete values[provider];
+			return values;
+		} catch {
+			throw new Error(
+				"Team auth: cannot safely read upstream auth.json; inspect its format, size, permissions, and links.",
+			);
+		}
 	}
 
 	private getUpstreamAuthCandidate(
@@ -570,26 +642,29 @@ export class AuthStorage {
 		});
 	}
 
-	private getAuthSourceCandidates(provider: string, options?: { includeFallback?: boolean }): AuthSourceCandidate[] {
-		const fallbackCandidate =
-			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider);
-		const candidates =
+	private *getAuthSourceCandidates(
+		provider: string,
+		options?: { includeFallback?: boolean },
+	): Generator<AuthSourceCandidate> {
+		const factories =
 			provider === PRIME_INFERENCE_PROVIDER_ID
 				? [
-						this.getRuntimeAuthCandidate(provider),
-						this.getEnvironmentAuthCandidate(provider),
-						this.getStoredAuthCandidate(provider),
-						this.getUpstreamAuthCandidate(provider),
-						fallbackCandidate,
+						() => this.getRuntimeAuthCandidate(provider),
+						() => this.getEnvironmentAuthCandidate(provider),
+						() => this.getStoredAuthCandidate(provider),
+						() => this.getUpstreamAuthCandidate(provider),
 					]
 				: [
-						this.getRuntimeAuthCandidate(provider),
-						this.getStoredAuthCandidate(provider),
-						this.getUpstreamAuthCandidate(provider),
-						this.getEnvironmentAuthCandidate(provider),
-						fallbackCandidate,
+						() => this.getRuntimeAuthCandidate(provider),
+						() => this.getStoredAuthCandidate(provider),
+						() => this.getEnvironmentAuthCandidate(provider),
+						() => this.getUpstreamAuthCandidate(provider),
 					];
-		return candidates.filter((candidate): candidate is AuthSourceCandidate => candidate !== undefined);
+		if (options?.includeFallback !== false) factories.push(() => this.getFallbackAuthCandidate(provider));
+		for (const factory of factories) {
+			const candidate = factory();
+			if (candidate) yield candidate;
+		}
 	}
 
 	private isAuthSourceStale(provider: string, candidate: AuthSourceCandidate): boolean {
@@ -676,6 +751,31 @@ export class AuthStorage {
 		return this.getAuthSourceTokenForCandidate(provider, candidate);
 	}
 
+	/** Read the selected OAuth identity without refreshing or mutating upstream. */
+	getSelectedOAuthCredential(provider: string, expectedSource?: AuthSourceToken): OAuthCredential | undefined {
+		if (this.upstreamHome) this.reload();
+		const { candidate } = this.getAvailableAuthCandidate(provider);
+		if (!candidate || (candidate.source !== "stored" && candidate.source !== "upstream")) return undefined;
+		const credential = candidate.source === "stored" ? this.data[provider] : this.getUpstreamCredential(provider);
+		if (credential?.type !== "oauth" || Date.now() >= credential.expires) return undefined;
+		const exact =
+			candidate.source === "stored"
+				? this.getStoredAuthCandidate(provider)
+				: this.getUpstreamAuthCandidate(provider, credential);
+		if (!exact || this.isAuthSourceStale(provider, exact)) return undefined;
+		const selectedToken = this.getAuthSourceTokenForCandidate(provider, candidate);
+		const actualToken = this.getAuthSourceTokenForCandidate(provider, exact);
+		const same = (a: AuthSourceToken | undefined, b: AuthSourceToken | undefined) =>
+			!!a &&
+			!!b &&
+			a.provider === b.provider &&
+			a.source === b.source &&
+			a.identityFingerprint === b.identityFingerprint &&
+			a.valueFingerprint === b.valueFingerprint;
+		if (!same(selectedToken, actualToken) || (expectedSource && !same(expectedSource, actualToken))) return undefined;
+		return credential;
+	}
+
 	markAuthSourceStale(token: AuthSourceToken): boolean {
 		if (token.provider.length === 0) {
 			return false;
@@ -718,11 +818,18 @@ export class AuthStorage {
 		if (!content) {
 			return {};
 		}
-		const data: unknown = JSON.parse(content);
+		let data: unknown;
+		try {
+			data = JSON.parse(content);
+		} catch {
+			throw new Error("Invalid auth storage JSON");
+		}
 		if (typeof data !== "object" || data === null || Array.isArray(data)) {
 			throw new Error("Invalid auth storage: expected a JSON object");
 		}
-		return data as AuthStorageData;
+		const result = data as AuthStorageData;
+		if (this.upstreamHome) this.teamSuppressed(result);
+		return result;
 	}
 
 	/**
@@ -739,6 +846,7 @@ export class AuthStorage {
 			this.loadError = null;
 		} catch (error) {
 			this.loadError = error as Error;
+			if (this.upstreamHome) this.data = {};
 			this.recordError(error);
 		}
 	}
@@ -768,22 +876,32 @@ export class AuthStorage {
 	 * Get credential for a provider.
 	 */
 	get(provider: string): AuthCredential | undefined {
-		return this.data[provider] ?? undefined;
+		return provider === TEAM_METADATA ? undefined : (this.data[provider] ?? undefined);
 	}
 
 	/**
 	 * Set credential for a provider.
 	 */
 	set(provider: string, credential: AuthCredential): void {
+		if (provider === TEAM_METADATA) throw new Error("Reserved Team auth metadata key");
+		if (this.upstreamHome) {
+			const data = this.storage.withLock((current) => {
+				const data = this.parseStorageData(current);
+				data[provider] = credential;
+				this.setTeamSuppressed(data, provider, false);
+				return { result: data, next: JSON.stringify(data, null, 2) };
+			});
+			this.data = data;
+			this.loadError = null;
+		} else {
+			this.data[provider] = credential;
+			this.persistProviderChange(provider, credential);
+		}
 		this.clearStaleAuthSource(provider, "stored");
-		this.data[provider] = credential;
-		this.persistProviderChange(provider, credential);
 		this.notifyChanged();
 	}
 
-	/**
-	 * Remove credential for a provider.
-	 */
+	/** Remove a Team-owned credential; use logout for explicit upstream suppression. */
 	remove(provider: string): void {
 		this.clearStaleAuthSource(provider, "stored");
 		delete this.data[provider];
@@ -992,14 +1110,14 @@ export class AuthStorage {
 	 * List all providers with credentials.
 	 */
 	list(): string[] {
-		return Object.keys(this.data);
+		return Object.keys(this.data).filter((provider) => provider !== TEAM_METADATA);
 	}
 
 	/**
 	 * Check if credentials exist for a provider in auth.json.
 	 */
 	has(provider: string): boolean {
-		return provider in this.data;
+		return provider !== TEAM_METADATA && provider in this.data;
 	}
 
 	/**
@@ -1015,10 +1133,18 @@ export class AuthStorage {
 	 * Return auth status without exposing credential values or refreshing tokens.
 	 */
 	getAuthStatus(provider: string): AuthStatus {
+		this.upstreamReadError = undefined;
 		if (this.upstreamHome) this.reload();
 		const status = this.getAuthStatusFromCandidates(provider);
+		if (!status.source && this.loadError && this.upstreamHome)
+			return {
+				configured: false,
+				source: "upstream",
+				label: "Team auth: cannot safely read Team auth.json; inspect its format and permissions.",
+			};
 		if (!status.source) {
 			const upstream = this.getUpstreamCredential(provider);
+			if (this.upstreamReadError) return { configured: false, source: "upstream", label: this.upstreamReadError };
 			if (upstream?.type === "oauth" && Date.now() >= upstream.expires)
 				return {
 					configured: false,
@@ -1034,7 +1160,9 @@ export class AuthStorage {
 	 * Get all credentials (for passing to getOAuthApiKey).
 	 */
 	getAll(): AuthStorageData {
-		return { ...this.data };
+		const data = { ...this.data };
+		delete data[TEAM_METADATA];
+		return data;
 	}
 
 	drainErrors(): Error[] {
@@ -1060,6 +1188,24 @@ export class AuthStorage {
 	 * Logout from a provider.
 	 */
 	logout(provider: string): void {
+		if (
+			this.upstreamHome &&
+			!provider.startsWith("mcp:") &&
+			provider !== "serper" &&
+			provider !== "prime-agent-traces"
+		) {
+			const data = this.storage.withLock((current) => {
+				const data = this.parseStorageData(current);
+				delete data[provider];
+				this.setTeamSuppressed(data, provider, true);
+				return { result: data, next: JSON.stringify(data, null, 2) };
+			});
+			this.data = data;
+			this.loadError = null;
+			this.clearStaleAuthSource(provider, "stored");
+			this.notifyChanged();
+			return;
+		}
 		if (provider === PRIME_INFERENCE_PROVIDER_ID) {
 			this.removeVerified(provider);
 			return;
@@ -1129,6 +1275,7 @@ export class AuthStorage {
 		providerId: string,
 		options?: { includeFallback?: boolean },
 	): Promise<AuthApiKeyResult> {
+		this.upstreamReadError = undefined;
 		if (this.upstreamHome) this.reload();
 		// Runtime overrides take precedence over stored credentials and environment keys.
 		const runtimeCandidate = this.getRuntimeAuthCandidate(providerId);
@@ -1230,6 +1377,18 @@ export class AuthStorage {
 				}
 			}
 		}
+		// Stored auth wins over environment variables for non-Prime-Inference providers.
+		if (
+			providerId !== PRIME_INFERENCE_PROVIDER_ID &&
+			envKey &&
+			envCandidate &&
+			!this.isAuthSourceStale(providerId, envCandidate)
+		) {
+			return {
+				apiKey: envKey,
+				sourceToken: this.getAuthSourceTokenForCandidate(providerId, envCandidate),
+			};
+		}
 		// Upstream OAuth is read-only: refreshing it may rotate the shared token and
 		// invalidate the main application. Expired credentials require Team login.
 		const upstream = this.getUpstreamCredential(providerId);
@@ -1255,18 +1414,6 @@ export class AuthStorage {
 			};
 		}
 
-		// Stored auth wins over environment variables for non-Prime-Inference providers.
-		if (
-			providerId !== PRIME_INFERENCE_PROVIDER_ID &&
-			envKey &&
-			envCandidate &&
-			!this.isAuthSourceStale(providerId, envCandidate)
-		) {
-			return {
-				apiKey: envKey,
-				sourceToken: this.getAuthSourceTokenForCandidate(providerId, envCandidate),
-			};
-		}
 		if (options?.includeFallback !== false) {
 			const fallbackCandidate = this.getFallbackAuthCandidate(providerId);
 			if (fallbackCandidate && !this.isAuthSourceStale(providerId, fallbackCandidate)) {
@@ -1301,6 +1448,7 @@ export class AuthStorage {
 				const credential = update(data[PRIME_INFERENCE_PROVIDER_ID]);
 				if (!credential) return { result: data };
 				data[PRIME_INFERENCE_PROVIDER_ID] = credential;
+				if (this.upstreamHome) this.setTeamSuppressed(data, PRIME_INFERENCE_PROVIDER_ID, false);
 				return { result: data, next: JSON.stringify(data, null, 2) };
 			});
 			this.data = data;

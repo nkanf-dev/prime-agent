@@ -360,6 +360,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		}
 
 		if (status.source === "upstream") {
+			if (!status.configured && !status.credentialType && status.label) return theme.fg("warning", status.label);
 			if (status.credentialType !== provider.authType) return theme.fg("muted", "unconfigured");
 			return theme.fg(status.configured ? "success" : "warning", status.label ?? "upstream Prime Agent");
 		}

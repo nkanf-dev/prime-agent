@@ -242,7 +242,13 @@ export class ProviderAuthFlows {
 	}
 
 	runLogout(): Promise<string | null> {
-		const providerOptions = this.getLogoutProviderOptions();
+		let providerOptions: AuthSelectorProvider[];
+		try {
+			providerOptions = this.getLogoutProviderOptions();
+		} catch (error) {
+			this.host.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+			return Promise.resolve(null);
+		}
 		if (providerOptions.length === 0) {
 			this.host.showStatus(
 				"No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
@@ -292,10 +298,16 @@ export class ProviderAuthFlows {
 						}
 						this.host.modelRegistry.refresh();
 						await this.host.onAuthChanged?.();
+						const teamOverlayEnabled = this.host.modelRegistry.authStorage.isUpstreamOverlayEnabled();
 						const message =
-							providerOption.authType === "oauth"
-								? `Logged out of ${providerOption.name}`
-								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
+							teamOverlayEnabled &&
+							!providerOption.id.startsWith("mcp:") &&
+							providerOption.id !== SERPER_CREDENTIAL_ID &&
+							providerOption.id !== PRIME_AGENT_TRACES_PROVIDER_ID
+								? `Removed any Team-stored credential and blocked upstream fallback for ${providerOption.name}. Upstream credentials, environment variables and models.json are unchanged.`
+								: providerOption.authType === "oauth"
+									? `Logged out of ${providerOption.name}`
+									: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
 						this.host.showStatus(message);
 						resolve(providerOption.id);
 					} catch (error: unknown) {
@@ -377,6 +389,18 @@ export class ProviderAuthFlows {
 			});
 		}
 
+		try {
+			for (const [providerId, credential] of Object.entries(authStorage.listUpstreamCredentials())) {
+				options.push({
+					id: providerId,
+					name: this.host.modelRegistry.getProviderDisplayName(providerId),
+					authType: credential.type === "oauth" ? "oauth" : "api_key",
+					category: "provider",
+				});
+			}
+		} catch (error) {
+			if (options.length === 0) throw error;
+		}
 		return options.sort((a, b) => a.name.localeCompare(b.name));
 	}
 

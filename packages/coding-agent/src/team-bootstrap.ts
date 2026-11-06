@@ -9,20 +9,26 @@ import {
 	lstatSync,
 	mkdirSync,
 	openSync,
-	readFileSync,
+	readSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 
-const PORTABLE_FILES = [
-	"settings.json",
-	"models.json",
-	"auth.json",
-	"keybindings.json",
-	"mcp-connections.json",
-] as const;
+const PORTABLE_FILES = ["settings.json", "models.json", "keybindings.json", "mcp-connections.json"] as const;
 const INCOMPLETE = ".team-bootstrap-incomplete";
+// The marker is never removed by a waiter. A crashed owner requires manual recovery.
+const MARKER_WAIT_MS = 10_000;
+const MARKER_POLL_MS = 20;
+const waitCell = new Int32Array(new SharedArrayBuffer(4));
+const MARKER_ERROR =
+	"Team bootstrap: import is in progress or interrupted. After stopping Team processes, inspect ~/.prime-team/agent and remove ~/.prime-team/.team-bootstrap-incomplete to resume; upstream data was not changed.";
+
+function waitForMarker(deadline: number): void {
+	const remaining = deadline - Date.now();
+	if (remaining <= 0) throw new Error(MARKER_ERROR);
+	Atomics.wait(waitCell, 0, 0, Math.min(MARKER_POLL_MS, remaining));
+}
 
 function statOrMissing(path: string) {
 	try {
@@ -52,7 +58,16 @@ function readPortableFile(
 		const opened = fstatSync(fd);
 		if (!opened.isFile() || opened.nlink !== 1 || opened.ino !== stat.ino || opened.dev !== stat.dev)
 			throw new Error("file changed");
-		const data = readFileSync(fd);
+		if (opened.size > 8 * 1024 * 1024) throw new Error("file too large");
+		const bytes = Buffer.allocUnsafe(opened.size + 1);
+		let offset = 0;
+		while (offset < bytes.length) {
+			const count = readSync(fd, bytes, offset, bytes.length - offset, null);
+			if (count === 0) break;
+			offset += count;
+		}
+		if (offset !== opened.size) throw new Error("file changed while reading");
+		const data = bytes.subarray(0, offset);
 		let text = data.toString("utf8");
 		if (name === "models.json")
 			text = text
@@ -88,14 +103,48 @@ export function bootstrapTeamConfig(home: string): void {
 	const sourceParent = join(home, ".prime");
 	const source = join(sourceParent, "agent");
 	const marker = join(parent, INCOMPLETE);
+	const deadline = Date.now() + MARKER_WAIT_MS;
 	if (assertDirectory(parent)) {
-		if (statOrMissing(marker))
-			throw new Error(
-				"Team bootstrap: import is in progress or interrupted. After stopping Team processes, inspect ~/.prime-team/agent and remove ~/.prime-team/.team-bootstrap-incomplete to resume; upstream data was not changed.",
-			);
-		assertDirectory(target);
+		while (statOrMissing(marker)) waitForMarker(deadline);
+		if (assertDirectory(target)) {
+			const auth = statOrMissing(join(target, "auth.json"));
+			if (auth && (!auth.isFile() || auth.isSymbolicLink() || auth.nlink !== 1))
+				throw new Error("Team bootstrap: unsafe Team auth.json; inspect links before retrying.");
+		}
 	}
 	if (!assertDirectory(sourceParent) || !assertDirectory(source)) return;
+	const readPair = (name: string) => {
+		try {
+			const existing = readPortableFile(join(target, name), name, false);
+			// Existing files are user-owned; missing credentials use the read-only overlay.
+			const upstream = existing ? undefined : readPortableFile(join(source, name), name, true);
+			return { existing, upstream };
+		} catch {
+			throw new Error(
+				`Team bootstrap: cannot safely read or parse ${name}; inspect upstream and Team files, then retry. No existing files were overwritten.`,
+			);
+		}
+	};
+	// Validate a complete configuration without acquiring the marker. Recheck the marker
+	// after the scan so an import already in progress cannot be mistaken for completion.
+	if (assertDirectory(parent) && assertDirectory(target)) {
+		for (;;) {
+			while (statOrMissing(marker)) waitForMarker(deadline);
+			let needsImport = false;
+			try {
+				for (const name of PORTABLE_FILES) {
+					const { existing, upstream } = readPair(name);
+					if (!existing && upstream) needsImport = true;
+				}
+			} catch (error) {
+				if (statOrMissing(marker)) continue;
+				throw error;
+			}
+			if (statOrMissing(marker)) continue;
+			if (!needsImport) return;
+			break;
+		}
+	}
 	try {
 		ensureDirectory(parent);
 	} catch {
@@ -104,29 +153,20 @@ export function bootstrapTeamConfig(home: string): void {
 		);
 	}
 	let markerFd: number;
-	try {
-		markerFd = openSync(marker, "wx", 0o600);
-	} catch {
-		throw new Error(
-			"Team bootstrap: another import is in progress or interrupted. Stop Team processes and inspect ~/.prime-team/.team-bootstrap-incomplete before removing it to retry.",
-		);
+	for (;;) {
+		try {
+			markerFd = openSync(marker, "wx", 0o600);
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error(MARKER_ERROR);
+			waitForMarker(deadline);
+		}
 	}
 	closeSync(markerFd);
 	try {
 		ensureDirectory(target);
 		for (const name of PORTABLE_FILES) {
-			let existing: ReturnType<typeof readPortableFile>;
-			let upstream: ReturnType<typeof readPortableFile>;
-			try {
-				existing = readPortableFile(join(target, name), name, false);
-				// Existing files are user-owned; missing credentials use the read-only overlay.
-				if (!existing) upstream = readPortableFile(join(source, name), name, true);
-			} catch {
-				throw new Error(
-					`Team bootstrap: cannot safely read or parse ${name}; inspect upstream and Team files, then retry. No existing files were overwritten.`,
-				);
-			}
-
+			const { existing, upstream } = readPair(name);
 			if (existing || !upstream) continue;
 			// Hard-link publication is atomic and fails if a competing writer created the target.
 			const temporary = join(target, `.team-bootstrap-${randomUUID()}.tmp`);

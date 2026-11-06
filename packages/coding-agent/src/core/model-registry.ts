@@ -545,6 +545,8 @@ export class ModelRegistry {
 		{ settings: string; fingerprint: string; models: Static<typeof ModelDefinitionSchema>[]; refreshedAt: number }
 	>();
 	private xaiModelSources = new WeakMap<Model<Api>, Model<Api>>();
+	private oauthModelSources = new WeakMap<Model<Api>, Model<Api>>();
+	private unmappedOAuthModels = new WeakSet<Model<Api>>();
 	private providerRequestConfigs: Map<string, ProviderRequestConfig> = new Map();
 	private staleProviderRequestAuthSources: Map<string, AuthSourceToken[]> = new Map();
 	private lastProviderAuthSourceTokens: Map<string, AuthSourceToken> = new Map();
@@ -705,14 +707,7 @@ export class ModelRegistry {
 			...this.loadBuiltInModels(overrides, modelOverrides, this.livePrimeInferenceModels),
 			...privateModels.values(),
 		];
-		let combined = this.mergeCustomModels(builtInModels, customModels);
-
-		for (const oauthProvider of this.authStorage.getOAuthProviders()) {
-			const cred = this.authStorage.get(oauthProvider.id);
-			if (cred?.type === "oauth" && oauthProvider.modifyModels) {
-				combined = oauthProvider.modifyModels(combined, cred);
-			}
-		}
+		const combined = this.mergeCustomModels(builtInModels, customModels);
 
 		this.models = combined;
 	}
@@ -972,7 +967,28 @@ export class ModelRegistry {
 	 * If models.json had errors, returns only built-in models.
 	 */
 	getAll(): Model<Api>[] {
-		return this.models.map((model) => this.getModelForCurrentAuth(model));
+		let models = this.models;
+		for (const provider of this.authStorage.getOAuthProviders()) {
+			if (!provider.modifyModels) continue;
+			const credential = this.authStorage.getSelectedOAuthCredential(provider.id);
+			if (!credential) continue;
+			const previous = new Map(models.map((model) => [JSON.stringify([model.provider, model.id]), model]));
+			// Keep the registry baseline immutable even if a custom modifier mutates its input.
+			models = provider.modifyModels(
+				models.map((model) => structuredClone(model)),
+				credential,
+			);
+			for (const model of models) {
+				const key = JSON.stringify([model.provider, model.id]);
+				const source = previous.get(key);
+				if (source && !this.unmappedOAuthModels.has(source)) {
+					this.oauthModelSources.set(model, this.oauthModelSources.get(source) ?? source);
+				} else {
+					this.unmappedOAuthModels.add(model);
+				}
+			}
+		}
+		return models.map((model) => this.getModelForCurrentAuth(model));
 	}
 
 	getModelForCurrentAuth(model: Model<Api>): Model<Api> {
@@ -1512,8 +1528,7 @@ export class ModelRegistry {
 	 * Find a model by provider and ID.
 	 */
 	find(provider: string, modelId: string): Model<Api> | undefined {
-		const model = this.models.find((m) => m.provider === provider && m.id === modelId);
-		return model ? this.getModelForCurrentAuth(model) : undefined;
+		return this.getAll().find((m) => m.provider === provider && m.id === modelId);
 	}
 
 	/**
@@ -1818,10 +1833,62 @@ export class ModelRegistry {
 	 */
 	async getApiKeyAndHeaders(model: Model<Api>, requestHeaders?: Record<string, string>): Promise<ResolvedRequestAuth> {
 		try {
+			const inputHeaders = model.headers;
+			const canonicalMatches = this.models.filter(
+				(candidate) => candidate.provider === model.provider && candidate.id === model.id,
+			);
+			if (this.unmappedOAuthModels.has(model) || canonicalMatches.length !== 1) {
+				return {
+					ok: false,
+					error: `Cannot safely resolve the source of model "${model.provider}/${model.id}". Select a registered model or register this provider and model; no request was sent.`,
+				};
+			}
+			const canonicalModel = canonicalMatches[0]!;
 			const providerConfig = this.providerRequestConfigs.get(model.provider);
 			const { apiKey, authSourceToken, credentialType } = await this.getProviderRequestAuth(model.provider);
+			const upstreamError = this.authStorage.getUpstreamAuthError();
+			if (apiKey === undefined && upstreamError) return { ok: false, error: upstreamError };
 
-			let requestModel: Model<Api> | undefined;
+			let requestModel: Model<Api> | undefined = canonicalModel ?? this.oauthModelSources.get(model);
+			const oauthProvider = this.authStorage.getOAuthProviders().find((provider) => provider.id === model.provider);
+			if (oauthProvider?.modifyModels) {
+				const source =
+					canonicalModel ??
+					this.oauthModelSources.get(model) ??
+					this.models.find((candidate) => candidate.provider === model.provider && candidate.id === model.id);
+				if (!source) {
+					return {
+						ok: false,
+						error: `Cannot safely resolve the source of model "${model.provider}/${model.id}" after OAuth modification. Re-select a model from the current list or fix the provider extension; no request was sent.`,
+					};
+				}
+				if (credentialType === "oauth") {
+					if (!authSourceToken)
+						return { ok: false, error: `Authentication changed for "${model.provider}". Retry the request.` };
+					const credential = this.authStorage.getSelectedOAuthCredential(model.provider, authSourceToken);
+					if (!credential) {
+						return { ok: false, error: `Authentication changed for "${model.provider}". Retry the request.` };
+					}
+					const models = this.models.some(
+						(candidate) => candidate.provider === source.provider && candidate.id === source.id,
+					)
+						? this.models
+						: [...this.models, source];
+					requestModel = oauthProvider
+						.modifyModels(
+							models.map((candidate) => structuredClone(candidate)),
+							credential,
+						)
+						.find((candidate) => candidate.provider === source.provider && candidate.id === source.id);
+					if (!requestModel)
+						return {
+							ok: false,
+							error: `Model "${model.provider}/${model.id}" is unavailable for the selected OAuth credential.`,
+						};
+				} else {
+					requestModel = source;
+				}
+			}
 			if (model.provider === "xai") {
 				if (!apiKey) {
 					return {
@@ -1829,7 +1896,7 @@ export class ModelRegistry {
 						error: "No usable xAI credential. Use /login and select an xAI entry to sign in again or configure an API key.",
 					};
 				}
-				const configuredModel = this.xaiModelSources.get(model) ?? model;
+				const configuredModel = requestModel ?? this.xaiModelSources.get(model) ?? model;
 				const subscription =
 					credentialType === "oauth" &&
 					(authSourceToken?.source === "stored" || authSourceToken?.source === "upstream");
@@ -1842,6 +1909,7 @@ export class ModelRegistry {
 				}
 			}
 
+			model = requestModel ?? model;
 			const providerHeaders = resolveHeadersOrThrow(providerConfig?.headers, `provider "${model.provider}"`);
 			const authStorageHeaders = this.authStorage.getProviderHeaders(model.provider);
 			const modelHeaders = resolveHeadersOrThrow(
@@ -1850,8 +1918,8 @@ export class ModelRegistry {
 			);
 
 			let headers =
-				model.headers || authStorageHeaders || providerHeaders || modelHeaders
-					? { ...model.headers, ...authStorageHeaders, ...providerHeaders, ...modelHeaders }
+				model.headers || inputHeaders || authStorageHeaders || providerHeaders || modelHeaders
+					? { ...model.headers, ...inputHeaders, ...authStorageHeaders, ...providerHeaders, ...modelHeaders }
 					: undefined;
 
 			if (providerConfig?.authHeader) {
@@ -1883,9 +1951,11 @@ export class ModelRegistry {
 				...(requestModel ? { requestModel } : {}),
 			};
 		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const upstreamError = this.authStorage.getUpstreamAuthError();
 			return {
 				ok: false,
-				error: error instanceof Error ? error.message : String(error),
+				error: upstreamError ? `${message} ${upstreamError}` : message,
 			};
 		}
 	}
@@ -1973,8 +2043,7 @@ export class ModelRegistry {
 	 */
 	isUsingOAuth(model: Model<Api>): boolean {
 		if (model.provider === "xai") return this.isUsingXaiSubscription(model);
-		const cred = this.authStorage.get(model.provider);
-		return cred?.type === "oauth";
+		return this.authStorage.getSelectedOAuthCredential(model.provider) !== undefined;
 	}
 
 	/**
@@ -2016,6 +2085,11 @@ export class ModelRegistry {
 		if (!existing) {
 			this.registeredProviders.set(providerName, config);
 			return;
+		}
+		// A later baseUrl-only registration rewrites all existing models immediately.
+		// Preserve that same effective baseline when the provider is reapplied after a refresh.
+		if (config.baseUrl && !config.models && existing.models) {
+			existing.models = existing.models.map((model) => ({ ...model, baseUrl: config.baseUrl }));
 		}
 		for (const k of Object.keys(config) as (keyof ProviderConfigInput)[]) {
 			if (config[k] !== undefined) {
@@ -2093,12 +2167,6 @@ export class ModelRegistry {
 					headers: undefined,
 					compat: modelDef.compat,
 				} as Model<Api>);
-			}
-			if (config.oauth?.modifyModels) {
-				const cred = this.authStorage.get(providerName);
-				if (cred?.type === "oauth") {
-					this.models = config.oauth.modifyModels(this.models, cred);
-				}
 			}
 		} else if (config.baseUrl || config.headers) {
 			this.models = this.models.map((m) => {
