@@ -45,8 +45,9 @@ common `~/.agents/skills` discovery path remains shared. Runtime data, sessions,
 logs, caches, sockets, daemons and ledgers are never imported.
 
 On Unix, newly created Team directories use mode 0700 and imported files use
-0600. The import rejects symlinked source and target configuration paths and
-invalid configuration JSON, and reports an error without printing file contents.
+0600. The import can read a user's existing upstream symlink or junction; it
+does not write to upstream. Team target links and invalid configuration JSON
+are rejected, and errors do not include file contents.
 Repair the source or set `PRIME_AGENT_TEAM_CODING_AGENT_DIR` to a separate
 configuration directory. If an interrupted import leaves
 `~/.prime-team/.team-bootstrap-incomplete`, inspect the Team directory, repair or

@@ -532,6 +532,8 @@ export type DaemonCommand =
 			fromActiveSessionId?: string;
 			/** Internal worker-origin marker; public clients remain unrestricted. */
 			agentOrigin?: boolean;
+			/** Authenticates a worker's own source on the supervisor link. */
+			workerToken?: string;
 			/** Stable caller operation ID for safe native-mesh retries. */
 			nativeMeshOperationId?: string;
 			deliveryMode?: AgentSessionMessageDeliveryMode;

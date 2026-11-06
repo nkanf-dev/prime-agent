@@ -6979,6 +6979,7 @@ export class AgentDaemon {
 					message,
 					fromActiveSessionId: fromState.activeSessionId,
 					agentOrigin: true,
+					...(this.options.worker ? { workerToken: this.options.worker.authenticationToken } : {}),
 					...(operationId === undefined ? {} : { nativeMeshOperationId: operationId }),
 				},
 				30_000,

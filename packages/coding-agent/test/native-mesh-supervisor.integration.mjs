@@ -29,7 +29,7 @@ async function create(i) {
  const env={...envbase,PRIME_AGENT_CODING_AGENT_DIR:dir,PRIME_AGENT_TEAM_CODING_AGENT_DIR:dir,PRIME_AGENT_TEAM_MESH_URL:`http://127.0.0.1:${port}`,PRIME_AGENT_TEAM_MESH_TOKEN:token,PRIME_AGENT_TEAM_MACHINE_ID:'host-'+i,...(i === 'a' ? {PRIME_MESH_TEST_PYTHON:'1'} : {})};
  const p=spawn(process.execPath,['--import',proot+'/node_modules/tsx/dist/loader.mjs',proot+'/packages/coding-agent/test/fixtures/mesh-supervisor.ts',socket,root],{env,stdio:['ignore','pipe','pipe']}); kids.push(p); logs[i]=''; p.stdout.on('data',b=>logs[i]+=b); p.stderr.on('data',b=>logs[i]+=b);
  let client=new DaemonClient(socket); for(let n=0;n<80;n++){if(p.exitCode!==null) throw Error('daemon exit '+i+' '+logs[i]); try{await client.connect(200);await client.waitForHello(1000); break}catch{client.close();client=new DaemonClient(socket); await wait(100)}}
- clients.push(client); const resp=await client.request({type:'create',name:'agent-'+i},30000); if(!resp.success) throw Error('create '+i+': '+resp.error); console.log('CREATE',i,JSON.stringify(resp.data)); return {client,session:resp.data};
+ clients.push(client); const resp=await client.request({type:'create',name:'agent-'+i,...(i === 'a' ? {lifecycle:'client_owned'} : {})},30000); if(!resp.success) throw Error('create '+i+': '+resp.error); console.log('CREATE',i,JSON.stringify(resp.data)); return {client,session:resp.data};
 }
 try {
  for(let n=0;n<40;n++){try {let r=await fetch(`http://127.0.0.1:${port}/v1/native-mesh/agents`,{headers:{authorization:'Bearer '+token}}); if(r.ok)break;}catch{} await wait(100)}
@@ -42,9 +42,18 @@ try {
  const workers=join(root,'agenta','daemon-workers');
  const descriptors=readdirSync(workers,{withFileTypes:true}).filter(e=>e.isDirectory()).flatMap(d =>
   readdirSync(join(workers,d.name)).filter(n=>n.endsWith('.json')).map(n => JSON.parse(readFileSync(join(workers,d.name,n),'utf8'))));
- const tokenForWorker=descriptors.find(d=>d.rootSessionId === as.sessionId)?.authenticationToken ??
-  descriptors.find(d=>typeof d.authenticationToken === 'string')?.authenticationToken;
- if(!tokenForWorker)throw Error('source worker descriptor not found');
+ const sourceDescriptor=descriptors.find(d=>d.rootSessionId === as.sessionId);
+ if(!sourceDescriptor?.ownerClientId || !sourceDescriptor.authenticationToken)
+  throw Error('source worker is not client-owned or its descriptor has no token');
+ const tokenForWorker=sourceDescriptor.authenticationToken;
+ // A different socket client must not be able to send as this private source.
+ const intruder=new DaemonClient(join(root,'sa.sock')); clients.push(intruder);
+ await intruder.connect(1000); await intruder.waitForHello(1000);
+ const unauthorized=await intruder.request({type:'send_message',fromActiveSessionId:as.activeSessionId??as.id,
+  agentOrigin:true,targetActiveSessionId:bid,message:'unauthorized-source',nativeMeshOperationId:'unauthorized-op'},30000);
+ if(unauthorized.success || unauthorized.error !== `Unknown active session: ${as.activeSessionId??as.id}`)
+  throw Error(`non-owner source was not denied as private: ${JSON.stringify(unauthorized)}`);
+ console.log('CLIENT_OWNED_SOURCE_DENIED_TO_NON_OWNER',true);
  let peerSeen=false;
  for(let n=0;n<40;n++){
   const peers=await a.client.request({type:'list_agent_peers',workerToken:tokenForWorker},5000);
@@ -142,5 +151,5 @@ print("PYTHON_AGENT_MESSAGE_OK")`;
  for(const k of kids){if(k.exitCode===null)k.kill('SIGKILL')};
  await Promise.all(kids.map(k => k.exitCode !== null || k.signalCode !== null ? Promise.resolve() : new Promise(resolve => k.once('exit',resolve))));
  if (process.exitCode) console.error('LOGS',JSON.stringify(logs));
- rmSync(root,{recursive:true,force:true});
+ rmSync(root,{recursive:true,force:true,maxRetries:5,retryDelay:100});
 }

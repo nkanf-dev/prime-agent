@@ -193,7 +193,7 @@ describe("OAuth model endpoints use the selected credential", () => {
 				modifyModels: (models, c) => {
 					const model = models.find((m) => m.provider === provider)!;
 					model.baseUrl = `https://${c.access}.example`;
-					model[field] = "renamed";
+					(model as Record<string, unknown>)[field] = "renamed";
 					return models;
 				},
 			},

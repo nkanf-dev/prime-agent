@@ -3159,10 +3159,28 @@ export class DaemonSupervisor {
 						? "Message was not stored: native forwarding is disabled on the mesh; restart that session"
 						: 'agent messages from daemon clients are not supported while agentMessageTransport is "cotal"',
 				);
-			// agentOrigin without fromActiveSessionId is trusted only at the direct socket-client boundary.
-			const source = command.fromActiveSessionId
-				? await this.findWorkerForClient(client, command.fromActiveSessionId)
-				: undefined;
+			// Worker links use a separate socket from the owner. A worker token grants
+			// only its own exact active session, never an arbitrary caller's source.
+			let source: WorkerMatch | undefined;
+			if (command.workerToken !== undefined) {
+				if (command.agentOrigin !== true || !command.fromActiveSessionId ||
+					typeof command.workerToken !== "string" || !command.workerToken)
+					throw new Error("Worker authentication failed");
+				const worker = [...this.workers.values()].find((candidate) =>
+					candidate.descriptor.authenticationToken === command.workerToken);
+				if (!worker || this.isWorkerStopping(worker) || worker.descriptor.lifecycle !== "ready" || !worker.client)
+					throw new Error("Worker authentication failed");
+				const entry = this.roster().byActiveSessionId(command.fromActiveSessionId);
+				if (!entry || entry.queuedChild || entry.workerId !== worker.descriptor.workerId ||
+					entry.summary.activeSessionId !== command.fromActiveSessionId)
+					throw new Error("Worker source authentication failed");
+				source = { worker, summary: sessionSummaryFromRosterEntry(entry) };
+			} else {
+				// Legacy client-origin requests retain their existing visibility boundary.
+				source = command.fromActiveSessionId
+					? await this.findWorkerForClient(client, command.fromActiveSessionId)
+					: undefined;
+			}
 			let target: WorkerMatch;
 			try {
 				target = await this.findWorkerForClient(client, command.targetActiveSessionId);

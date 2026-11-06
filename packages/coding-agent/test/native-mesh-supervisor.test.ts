@@ -237,3 +237,121 @@ describe("supervisor native mesh handoff", () => {
 		expect(messages.size).toBe(2);
 	});
 });
+
+
+describe("supervisor native mesh sender authorization", () => {
+	function authorizationSetup() {
+		const { a, b } = setup();
+		a.summary.sessionName = "owned-name";
+		const owner = { id: "owner" };
+		const outsider = { id: "outsider" };
+		const ownedWorker = {
+			client: {},
+			descriptor: {
+				workerId: "owned",
+				authenticationToken: "owned-token",
+				ownerClientId: owner.id,
+				rootActiveSessionId: a.summary.activeSessionId,
+				lifecycle: "ready",
+			},
+		};
+		const publicSummary = {
+			...a.summary,
+			id: "active-public",
+			activeSessionId: "active-public",
+			sessionId: "public-session",
+			sessionName: "public-name",
+		};
+		const publicWorker = {
+			client: {},
+			descriptor: {
+				workerId: "public",
+				authenticationToken: "public-token",
+				rootActiveSessionId: publicSummary.activeSessionId,
+				lifecycle: "ready",
+			},
+		};
+		const matches = [
+			{ worker: ownedWorker, summary: a.summary },
+			{ worker: publicWorker, summary: publicSummary },
+		];
+		Object.assign(a.supervisor, {
+			workers: new Map([["owned", ownedWorker], ["public", publicWorker]]),
+			roster: () => ({
+				byActiveSessionId: (id: string) => {
+					const match = matches.find(({ summary }) => summary.activeSessionId === id);
+					return match && { workerId: match.worker.descriptor.workerId, summary: match.summary };
+				},
+			}),
+			protocolClientIds: new WeakMap(),
+			refreshWorkerSummaries: vi.fn(async () => {}),
+			matchWorkers: vi.fn((selector: string, include?: (worker: any) => boolean) =>
+				matches.filter(
+					({ worker, summary }) =>
+						(!include || include(worker)) &&
+						[summary.activeSessionId, summary.sessionId, summary.sessionName].includes(selector),
+				),
+			),
+			sendNativeMeshMessage: vi.fn(async (_command: any, source: any) => ({
+				success: true,
+				data: { source: source.activeSessionId },
+			})),
+		});
+		const command = {
+			type: "send_message",
+			id: "send",
+			agentOrigin: true,
+			fromActiveSessionId: a.summary.activeSessionId,
+			targetActiveSessionId: b.id,
+			message: "hello",
+		};
+		return { supervisor: a.supervisor, owner, outsider, command, ownedSummary: a.summary, publicSummary };
+	}
+
+	it("authenticates a client-owned sender even when the requesting client cannot see it", async () => {
+		const { supervisor, outsider, command, ownedSummary } = authorizationSetup();
+		const authorized = { ...command, workerToken: "owned-token" };
+		const reply = await supervisor.handleCommand(outsider, authorized);
+		expect(reply).toMatchObject({ success: true, data: { source: ownedSummary.activeSessionId } });
+		expect(supervisor.sendNativeMeshMessage).toHaveBeenCalledOnce();
+		expect(supervisor.sendNativeMeshMessage).toHaveBeenCalledWith(authorized, expect.objectContaining(ownedSummary));
+	});
+
+	it("rejects invalid tokens and tokens used to impersonate another worker", async () => {
+		const { supervisor, owner, command, publicSummary } = authorizationSetup();
+		for (const attempt of [
+			{ ...command, workerToken: "wrong-token" },
+			{ ...command, workerToken: "" },
+			{ ...command, workerToken: "public-token" },
+			{ ...command, fromActiveSessionId: publicSummary.activeSessionId, workerToken: "owned-token" },
+			{ ...command, fromActiveSessionId: undefined, workerToken: "owned-token" },
+		]) {
+			await expect(supervisor.handleCommand(owner, attempt)).rejects.toThrow();
+		}
+		expect(supervisor.sendNativeMeshMessage).not.toHaveBeenCalled();
+	});
+
+	it("rejects session ID and name aliases when a worker token is present", async () => {
+		const { supervisor, owner, command, ownedSummary } = authorizationSetup();
+		for (const alias of [ownedSummary.sessionId, ownedSummary.sessionName]) {
+			await expect(
+				supervisor.handleCommand(owner, { ...command, fromActiveSessionId: alias, workerToken: "owned-token" }),
+			).rejects.toThrow();
+		}
+		expect(supervisor.sendNativeMeshMessage).not.toHaveBeenCalled();
+	});
+
+	it("preserves client visibility rules when no token is supplied", async () => {
+		const { supervisor, owner, outsider, command, ownedSummary, publicSummary } = authorizationSetup();
+		await expect(supervisor.handleCommand(outsider, command)).rejects.toThrow();
+		expect(supervisor.sendNativeMeshMessage).not.toHaveBeenCalled();
+		await expect(supervisor.handleCommand(owner, command)).resolves.toMatchObject({ success: true });
+		await expect(
+			supervisor.handleCommand(outsider, { ...command, fromActiveSessionId: publicSummary.sessionName }),
+		).resolves.toMatchObject({ success: true });
+		expect(supervisor.sendNativeMeshMessage.mock.calls.map((call: any[]) => call[1])).toEqual([
+			ownedSummary,
+			publicSummary,
+		]);
+	});
+});
