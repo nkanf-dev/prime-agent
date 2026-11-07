@@ -7,11 +7,12 @@ import { randomUUID } from "node:crypto";
 import {
 	closeSync,
 	fsyncSync,
+	linkSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readFileSync,
-	renameSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -91,21 +92,31 @@ export class NativeMeshOutbox {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 		const temp = join(this.directory, `.tmp-${randomUUID()}`);
-		const fd = openSync(temp, "wx", 0o600);
+		let created = false;
 		try {
-			writeFileSync(fd, `${JSON.stringify(item)}\n`);
-			fsyncSync(fd);
-		} finally {
-			closeSync(fd);
-		}
-		try {
-			renameSync(temp, path);
-			syncDirectory(this.directory);
-		} catch (error) {
+			const fd = openSync(temp, "wx", 0o600);
+			created = true;
 			try {
-				unlinkSync(temp);
-			} catch {}
-			throw error;
+				writeFileSync(fd, `${JSON.stringify(item)}\n`);
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+			try {
+				// Publish without replacing an existing or corrupt directory entry.
+				linkSync(temp, path);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				const old = this.read(id);
+				if (JSON.stringify(old) !== JSON.stringify(item)) throw new Error("Conflicting native mesh outbox request");
+			}
+			syncDirectory(this.directory);
+		} finally {
+			if (created) {
+				try {
+					unlinkSync(temp);
+				} catch {}
+			}
 		}
 		return id;
 	}
@@ -120,7 +131,9 @@ export class NativeMeshOutbox {
 
 	read(id: string): NativeMeshOutboxItem {
 		if (!/^nm1m-[a-f0-9]{64}$/.test(id)) throw new Error("Invalid native mesh request ID");
-		const item = JSON.parse(readFileSync(this.path(id), "utf8")) as NativeMeshOutboxItem;
+		const path = this.path(id);
+		if (!lstatSync(path).isFile()) throw new Error("Invalid native mesh outbox item");
+		const item = JSON.parse(readFileSync(path, "utf8")) as NativeMeshOutboxItem;
 		validate(item);
 		if (nativeMeshRequestId(item.from, item.callerMessageId) !== id)
 			throw new Error("Native mesh outbox identity mismatch");

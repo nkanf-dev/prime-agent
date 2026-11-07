@@ -199,9 +199,9 @@ import {
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import { type NativeMeshConfig, nativeMeshConfigFromEnvironment } from "./native-mesh/config.js";
+import { nativeMeshDiagnostic } from "./native-mesh/diagnostic.js";
 import { NativeMeshOperations } from "./native-mesh/operations.js";
 import { NativeMeshOutbox } from "./native-mesh/outbox.js";
-import { nativeMeshDiagnostic } from "./native-mesh/diagnostic.js";
 import { type NativeMeshObservation, NativeMeshTransport, nativeMeshAgentId } from "./native-mesh/transport.js";
 import {
 	createRlmLedgerRegistrySeedSource,
@@ -796,6 +796,7 @@ export class DaemonSupervisor {
 	private nativeOperations?: NativeMeshOperations;
 	private nativeMeshTimer?: ReturnType<typeof setInterval>;
 	private nativeMeshSweep?: Promise<void>;
+	private nativeMeshRecoveryFailed = false;
 	private readonly nativeOutboxSends = new Set<Promise<void>>();
 	private nativeObservations = new Map<string, NativeMeshObservation>();
 	private readonly nativeAttempts = new Map<
@@ -925,12 +926,8 @@ export class DaemonSupervisor {
 					join(this.descriptorDir, "native-mesh-outbox"),
 					this.nativeMesh,
 					(id) => {
-						// Older outbox entries predate operation bindings.
-						try {
-							this.nativeOperations!.markStored(id);
-						} catch (error) {
-							if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-						}
+						// Never remove an outbox record unless its receipt marker was persisted.
+						this.nativeOperations!.markStored(id);
 					},
 				);
 			}
@@ -3164,16 +3161,25 @@ export class DaemonSupervisor {
 			// only its own exact active session, never an arbitrary caller's source.
 			let source: WorkerMatch | undefined;
 			if (command.workerToken !== undefined) {
-				if (command.agentOrigin !== true || !command.fromActiveSessionId ||
-					typeof command.workerToken !== "string" || !command.workerToken)
+				if (
+					command.agentOrigin !== true ||
+					!command.fromActiveSessionId ||
+					typeof command.workerToken !== "string" ||
+					!command.workerToken
+				)
 					throw new Error("Worker authentication failed");
-				const worker = [...this.workers.values()].find((candidate) =>
-					candidate.descriptor.authenticationToken === command.workerToken);
+				const worker = [...this.workers.values()].find(
+					(candidate) => candidate.descriptor.authenticationToken === command.workerToken,
+				);
 				if (!worker || this.isWorkerStopping(worker) || worker.descriptor.lifecycle !== "ready" || !worker.client)
 					throw new Error("Worker authentication failed");
 				const entry = this.roster().byActiveSessionId(command.fromActiveSessionId);
-				if (!entry || entry.queuedChild || entry.workerId !== worker.descriptor.workerId ||
-					entry.summary.activeSessionId !== command.fromActiveSessionId)
+				if (
+					!entry ||
+					entry.queuedChild ||
+					entry.workerId !== worker.descriptor.workerId ||
+					entry.summary.activeSessionId !== command.fromActiveSessionId
+				)
 					throw new Error("Worker source authentication failed");
 				source = { worker, summary: sessionSummaryFromRosterEntry(entry) };
 			} else {
@@ -4522,25 +4528,61 @@ export class DaemonSupervisor {
 		// before outbox enqueue; sending twice uses the exact same broker ID.
 		const recoveryStarted = Date.now();
 		nativeMeshDiagnostic.record({ component: "supervisor", stage: "outbox-recovery", status: "start" });
+		let recoveryFailed = false;
+		let recovery: ReturnType<NativeMeshOperations["inspectRecovery"]> | undefined;
 		try {
-			for (const id of this.nativeOperations!.pending()) {
-				const operation = this.nativeOperations!.read(id);
-				this.nativeOutbox!.enqueue({
-					from: operation.from,
-					to: operation.to,
-					text: operation.text,
-					callerMessageId: operation.operationId,
-				});
-			}
-			for (const id of this.nativeOutbox!.pending()) {
-				if (this.shuttingDown) return;
-				void this.sendNativeOutbox(id).catch(() => undefined);
-			}
-			nativeMeshDiagnostic.record({ component: "supervisor", stage: "outbox-recovery", status: "success", durationMs: Math.max(0, Date.now() - recoveryStarted) });
-		} catch (error) {
-			nativeMeshDiagnostic.record({ component: "supervisor", stage: "outbox-recovery", status: "failure", durationMs: Math.max(0, Date.now() - recoveryStarted) });
-			throw error;
+			recovery = this.nativeOperations!.inspectRecovery();
+			recoveryFailed = recovery.blocked.size > 0;
+		} catch {
+			// A directory-wide failure makes all outbound recovery unsafe, but inbound
+			// discovery and delivery are independent and should still run.
+			recoveryFailed = true;
 		}
+		if (recovery) {
+			for (const id of recovery.pending) {
+				try {
+					const operation = this.nativeOperations!.readForSend(id);
+					this.nativeOutbox!.enqueue({
+						from: operation.from,
+						to: operation.to,
+						text: operation.text,
+						callerMessageId: operation.operationId,
+					});
+				} catch {
+					recovery.blocked.add(id);
+					recoveryFailed = true;
+				}
+			}
+			try {
+				for (const id of this.nativeOutbox!.pending()) {
+					if (this.shuttingDown) return;
+					if (recovery.blocked.has(id)) continue;
+					try {
+						this.validateNativeOutbox(id);
+					} catch {
+						recoveryFailed = true;
+						continue;
+					}
+					void this.sendNativeOutbox(id).catch(() => undefined);
+				}
+			} catch {
+				recoveryFailed = true;
+			}
+		}
+		if (recoveryFailed !== !!this.nativeMeshRecoveryFailed) {
+			this.nativeMeshRecoveryFailed = recoveryFailed;
+			this.log(
+				recoveryFailed
+					? "Native mesh journal recovery scan blocked; inbound synchronization continues"
+					: "Native mesh journal recovery scan clear; sends may still fail",
+			);
+		}
+		nativeMeshDiagnostic.record({
+			component: "supervisor",
+			stage: "outbox-recovery",
+			status: recoveryFailed ? "failure" : "success",
+			durationMs: Math.max(0, Date.now() - recoveryStarted),
+		});
 		const discoveryStarted = Date.now();
 		nativeMeshDiagnostic.record({ component: "supervisor", stage: "discover", status: "start" });
 		let discovered: NativeMeshObservation[];
@@ -4696,8 +4738,22 @@ export class DaemonSupervisor {
 		});
 	}
 
+	private validateNativeOutbox(id: string): void {
+		// Unbound legacy entries stay on disk for reconciliation, not blind replay.
+		const binding = this.nativeOperations!.readForSend(id);
+		const item = this.nativeOutbox!.read(id);
+		if (
+			binding.from !== item.from ||
+			binding.to !== item.to ||
+			binding.text !== item.text ||
+			binding.operationId !== item.callerMessageId
+		)
+			throw new Error("Native mesh operation and outbox disagree");
+	}
+
 	private async sendNativeOutbox(id: string): Promise<void> {
 		if (this.shuttingDown || !this.nativeOutbox) throw new Error("Native mesh is shutting down");
+		this.validateNativeOutbox(id);
 		const send = this.nativeOutbox.send(id);
 		this.nativeOutboxSends.add(send);
 		try {

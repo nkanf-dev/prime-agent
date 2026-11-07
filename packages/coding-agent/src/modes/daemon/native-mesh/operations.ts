@@ -8,6 +8,7 @@ import {
 	closeSync,
 	fsyncSync,
 	linkSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -146,6 +147,51 @@ export class NativeMeshOperations {
 		});
 	}
 
+	/**
+	 * Recovery-only scan. A bad entry stays on disk and is never retried. Unlike
+	 * pending(), one corrupt item must not block unrelated inbound messages.
+	 * A directory-level failure still throws; callers must not send that sweep.
+	 */
+	inspectRecovery(): { pending: string[]; blocked: Set<string> } {
+		const ids = readdirSync(this.directory)
+			.filter((name) => /^nm1m-[a-f0-9]{64}\.json$/.test(name))
+			.map((name) => name.slice(0, -5))
+			.sort();
+		const pending: string[] = [];
+		const blocked = new Set<string>();
+		for (const id of ids) {
+			try {
+				this.read(id);
+				if (!this.hasStoredMarker(id)) pending.push(id);
+			} catch {
+				blocked.add(id);
+			}
+		}
+		return { pending, blocked };
+	}
+
+	/** Validate the marker as well as the binding before any outbox send. */
+	readForSend(id: string): NativeMeshOperation {
+		const operation = this.read(id);
+		this.hasStoredMarker(id);
+		return operation;
+	}
+
+	private hasStoredMarker(id: string): boolean {
+		const path = this.markerPath(id);
+		let stat: ReturnType<typeof lstatSync>;
+		try {
+			stat = lstatSync(path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+		// Do not treat a dangling symlink as a missing marker.
+		if (!stat.isFile() || readFileSync(path, "utf8") !== `${id}\n`)
+			throw new Error("Invalid native mesh stored marker");
+		return true;
+	}
+
 	/** Record a broker-confirmed store; never call for an unknown or failed store. */
 	markStored(id: string): void {
 		this.read(id);
@@ -191,7 +237,9 @@ export class NativeMeshOperations {
 	/** Fail closed on malformed or identity-mismatched journal entries. */
 	read(id: string): NativeMeshOperation {
 		if (!/^nm1m-[a-f0-9]{64}$/.test(id)) throw new Error("Invalid native mesh request ID");
-		const item = JSON.parse(readFileSync(this.path(id), "utf8")) as NativeMeshOperation;
+		const path = this.path(id);
+		if (!lstatSync(path).isFile()) throw new Error("Invalid native mesh operation");
+		const item = JSON.parse(readFileSync(path, "utf8")) as NativeMeshOperation;
 		if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Invalid native mesh operation");
 		validate(item);
 		if (nativeMeshRequestId(item.from, item.operationId) !== id)

@@ -1,8 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { nativeMeshDiagnostic } from "../src/modes/daemon/native-mesh/diagnostic.js";
 import { NativeMeshOperations } from "../src/modes/daemon/native-mesh/operations.js";
 import { NativeMeshOutbox } from "../src/modes/daemon/native-mesh/outbox.js";
 import { nativeMeshAgentId, nativeMeshRequestId } from "../src/modes/daemon/native-mesh/transport.js";
@@ -238,7 +239,6 @@ describe("supervisor native mesh handoff", () => {
 	});
 });
 
-
 describe("supervisor native mesh sender authorization", () => {
 	function authorizationSetup() {
 		const { a, b } = setup();
@@ -276,7 +276,10 @@ describe("supervisor native mesh sender authorization", () => {
 			{ worker: publicWorker, summary: publicSummary },
 		];
 		Object.assign(a.supervisor, {
-			workers: new Map([["owned", ownedWorker], ["public", publicWorker]]),
+			workers: new Map([
+				["owned", ownedWorker],
+				["public", publicWorker],
+			]),
 			roster: () => ({
 				byActiveSessionId: (id: string) => {
 					const match = matches.find(({ summary }) => summary.activeSessionId === id);
@@ -353,5 +356,130 @@ describe("supervisor native mesh sender authorization", () => {
 			ownedSummary,
 			publicSummary,
 		]);
+	});
+});
+
+describe("isolated operation recovery", () => {
+	it("records failed then successful recovery without stopping inbound discovery", async () => {
+		const { a, transport } = setup();
+		const record = vi.spyOn(nativeMeshDiagnostic, "record").mockImplementation(() => {});
+		const inspect = vi.spyOn(a.supervisor.nativeOperations, "inspectRecovery").mockImplementationOnce(() => {
+			throw new Error("private journal error");
+		});
+		try {
+			await a.supervisor.sweepNativeMesh();
+			await a.supervisor.sweepNativeMesh();
+			expect(transport.discover).toHaveBeenCalledTimes(2);
+			expect(transport.pending).toHaveBeenCalledTimes(2);
+			const events = record.mock.calls.map(([event]) => event).filter((event) => event.stage === "outbox-recovery");
+			expect(events.map((event) => event.status)).toEqual(["start", "failure", "start", "success"]);
+			expect(a.supervisor.log.mock.calls.map((call: any[]) => call[0])).toEqual([
+				"Native mesh journal recovery scan blocked; inbound synchronization continues",
+				"Native mesh journal recovery scan clear; sends may still fail",
+			]);
+		} finally {
+			inspect.mockRestore();
+			record.mockRestore();
+		}
+	});
+	it("keeps invalid identity on disk, recovers a valid binding and continues inbound sweep", async () => {
+		const { a, transport } = setup();
+		const valid = { from: a.id, to: nativeMeshAgentId("remote", "good"), text: "safe", operationId: "valid" };
+		const good = a.supervisor.nativeOperations.bind(valid);
+		const bad = a.supervisor.nativeOperations.bind({ ...valid, operationId: "bad" });
+		a.supervisor.nativeOutbox.enqueue({ from: valid.from, to: valid.to, text: valid.text, callerMessageId: "bad" });
+		const path = join(a.directory, "operations", `${bad}.json`);
+		const old = JSON.parse(readFileSync(path, "utf8"));
+		old.operationId = "mismatch";
+		writeFileSync(path, JSON.stringify(old));
+		const damaged = readFileSync(path, "utf8");
+		await a.supervisor.sweepNativeMesh();
+		await settle();
+		expect(readFileSync(path, "utf8")).toBe(damaged);
+		expect(a.supervisor.nativeOutbox.pending()).toContain(bad);
+		expect(existsSync(join(a.directory, "operations", `${bad}.stored`))).toBe(false);
+		await expect(a.supervisor.sendNativeOutbox(bad)).rejects.toThrow();
+		expect(transport.discover).toHaveBeenCalledTimes(1);
+		expect(transport.pending).toHaveBeenCalledTimes(1);
+		expect(transport.store).toHaveBeenCalledTimes(1);
+		expect(transport.store.mock.calls[0]![0].callerMessageId).toBe("valid");
+		expect(a.supervisor.nativeOperations.read(good).operationId).toBe("valid");
+		expect(a.supervisor.log.mock.calls.map((x: any[]) => x[0]).join(" ")).not.toContain("mismatch");
+	});
+	it("blocks conflicting, invalid-marker, and unbound outbox entries before network send", async () => {
+		const { a, transport } = setup();
+		const base = { from: a.id, to: nativeMeshAgentId("remote", "good"), text: "safe", operationId: "valid" };
+		const id = a.supervisor.nativeOperations.bind(base);
+		a.supervisor.nativeOutbox.enqueue({
+			from: base.from,
+			to: base.to,
+			text: "different",
+			callerMessageId: base.operationId,
+		});
+		await a.supervisor.sweepNativeMesh();
+		await settle();
+		expect(transport.store).not.toHaveBeenCalled();
+		expect(a.supervisor.nativeOutbox.pending()).toContain(id);
+		expect(transport.pending).toHaveBeenCalledTimes(1);
+		const bad = a.supervisor.nativeOperations.bind({ ...base, operationId: "marker" });
+		a.supervisor.nativeOutbox.enqueue({ from: base.from, to: base.to, text: base.text, callerMessageId: "marker" });
+		writeFileSync(join(a.directory, "operations", `${bad}.stored`), "invalid");
+		const legacy = a.supervisor.nativeOutbox.enqueue({
+			from: base.from,
+			to: base.to,
+			text: base.text,
+			callerMessageId: "unbound",
+		});
+		await a.supervisor.sweepNativeMesh();
+		await settle();
+		expect(transport.store).not.toHaveBeenCalled();
+		expect(a.supervisor.nativeOutbox.pending()).toEqual(expect.arrayContaining([id, bad, legacy]));
+		expect(transport.pending).toHaveBeenCalledTimes(2);
+	});
+	it.skipIf(process.platform === "win32")("does not treat a dangling marker symlink as an absent marker", async () => {
+		const { a, transport } = setup();
+		const base = { from: a.id, to: nativeMeshAgentId("remote", "good"), text: "safe", operationId: "symlink" };
+		const id = a.supervisor.nativeOperations.bind(base);
+		a.supervisor.nativeOutbox.enqueue({
+			from: base.from,
+			to: base.to,
+			text: base.text,
+			callerMessageId: base.operationId,
+		});
+		symlinkSync(join(a.directory, "absent"), join(a.directory, "operations", `${id}.stored`));
+		await a.supervisor.sweepNativeMesh();
+		await settle();
+		expect(transport.store).not.toHaveBeenCalled();
+		expect(transport.pending).toHaveBeenCalledTimes(1);
+		expect(a.supervisor.nativeOutbox.pending()).toContain(id);
+	});
+	it("retains the outbox if its binding disappears while a store is in flight", async () => {
+		const { a, transport } = setup();
+		const base = { from: a.id, to: nativeMeshAgentId("remote", "good"), text: "safe", operationId: "race" };
+		const id = a.supervisor.nativeOperations.bind(base);
+		a.supervisor.nativeOutbox.enqueue({
+			from: base.from,
+			to: base.to,
+			text: base.text,
+			callerMessageId: base.operationId,
+		});
+		transport.store.mockImplementationOnce(async () => {
+			rmSync(join(a.directory, "operations", `${id}.json`));
+			return { requestId: id, deliveryStatus: "stored" as const };
+		});
+		await expect(a.supervisor.sendNativeOutbox(id)).rejects.toThrow();
+		expect(a.supervisor.nativeOutbox.pending()).toContain(id);
+		expect(existsSync(join(a.directory, "operations", `${id}.stored`))).toBe(false);
+	});
+	it("directory scan failure blocks outbox but not discovery or pending", async () => {
+		const { a, transport } = setup();
+		a.supervisor.nativeOperations.inspectRecovery = () => {
+			throw new Error("secret");
+		};
+		await a.supervisor.sweepNativeMesh();
+		expect(transport.discover).toHaveBeenCalledTimes(1);
+		expect(transport.pending).toHaveBeenCalledTimes(1);
+		expect(transport.store).not.toHaveBeenCalled();
+		expect(a.supervisor.log.mock.calls.map((x: any[]) => x[0]).join(" ")).not.toContain("secret");
 	});
 });

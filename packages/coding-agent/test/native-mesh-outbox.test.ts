@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -115,4 +115,15 @@ describe("native mesh durable outbox", () => {
 		expect(box.pending()).toEqual([id]);
 		expect(store).not.toHaveBeenCalled();
 	});
+});
+
+it.skipIf(process.platform === "win32")("does not replace a dangling outbox symlink during recovery enqueue", () => {
+	const dir = directory();
+	const box = new NativeMeshOutbox(dir, { store: vi.fn() });
+	const entry = { from, to, text: "safe", callerMessageId: "entry" };
+	const id = nativeMeshRequestId(from, entry.callerMessageId);
+	const path = join(dir, `${id}.json`);
+	symlinkSync(join(dir, "missing"), path);
+	expect(() => box.enqueue(entry)).toThrow();
+	expect(lstatSync(path).isSymbolicLink()).toBe(true);
 });
