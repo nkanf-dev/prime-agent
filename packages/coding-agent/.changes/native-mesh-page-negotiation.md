@@ -1,0 +1,1 @@
+- Improved native mesh discovery performance while retaining compatibility with older servers.

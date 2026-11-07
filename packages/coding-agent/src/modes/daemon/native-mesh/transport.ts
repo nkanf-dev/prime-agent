@@ -337,8 +337,8 @@ export class NativeMeshTransport {
 		const started = Date.now();
 		const deadline = started + this.discoveryTimeoutMs;
 		let pages = 0;
-		let pageLimit = 1000;
-		let firstRequest = true;
+		let pageLimit = 4000;
+		let negotiating = true;
 		let bytes = 0,
 			records = 0;
 		const budget = {
@@ -359,16 +359,18 @@ export class NativeMeshTransport {
 						query.set("after", after);
 						query.set("revision", revision!);
 					}
-					const isFirstRequest = firstRequest;
-					firstRequest = false;
 					let raw: unknown;
 					try {
 						raw = await this.request("discover", `/v1/native-mesh/agents?${query}`, "GET", undefined, budget);
 					} catch (error) {
-						// Legacy servers reject the larger page size. Retry only the first request,
-						// before consuming any page, and retain all original scan limits.
-						if (isFirstRequest && error instanceof NativeMeshRequestError && error.status === 400) {
-							pageLimit = 100;
+						// Negotiate only on consecutive initial 400s, before any page or 409 retry.
+						if (
+							negotiating &&
+							pageLimit > 100 &&
+							error instanceof NativeMeshRequestError &&
+							error.status === 400
+						) {
+							pageLimit = pageLimit === 4000 ? 1000 : 100;
 							recordNativeMeshDiagnostic({
 								component: "supervisor",
 								operation: "discover",
@@ -378,8 +380,10 @@ export class NativeMeshTransport {
 							});
 							continue;
 						}
+						negotiating = false;
 						throw error;
 					}
+					negotiating = false;
 					const result = record(raw);
 					if (!Array.isArray(result?.agents)) throw validationFailure("discover");
 					const agents = result.agents.map(observation);
