@@ -3451,6 +3451,33 @@ function makeRuntimeSession(
 		get sessionName() {
 			return sessionManager.getSessionName();
 		},
+		observeAgentMessagePromptOutcome(
+			this: {
+				waitForAgentMessagePromptDelivery(id: string): Promise<void>;
+				waitForAgentMessagePromptCompletion(id: string): Promise<void>;
+			},
+			id: string,
+			listener: (leg: "delivery" | "completion", error?: Error) => void,
+		) {
+			let active = true;
+			for (const leg of ["delivery", "completion"] as const) {
+				const promise =
+					leg === "delivery"
+						? this.waitForAgentMessagePromptDelivery(id)
+						: this.waitForAgentMessagePromptCompletion(id);
+				void promise.then(
+					() => {
+						if (active) listener(leg);
+					},
+					(error) => {
+						if (active) listener(leg, error);
+					},
+				);
+			}
+			return () => {
+				active = false;
+			};
+		},
 		setSubagentRuntimeHost: vi.fn(),
 		getRlmChildRunStatus: vi.fn(() => "running"),
 		getRlmChildSnapshots: vi.fn(() => []),
@@ -4448,6 +4475,1695 @@ describe("mesh worker persistence", () => {
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
 
+	it.each(["open", "reconnect"] as const)(
+		"native retries stay bounded while a real tool keeps delivery queued (%s)",
+		async (mode) => {
+			const h = harness();
+			await h.authenticate("native");
+			const entered = createDeferred();
+			const release = createDeferred();
+			const live = await createHarness({
+				persistSession: true,
+				tools: [
+					{
+						name: "hold",
+						label: "Hold",
+						description: "test gate",
+						parameters: Type.Object({}),
+						execute: async () => {
+							entered.resolve();
+							await release.promise;
+							return { content: [], details: {} };
+						},
+					},
+				],
+			});
+			const state = makeState("target");
+			state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("tool done"),
+				fauxAssistantMessage("message done"),
+			]);
+			const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt");
+			const observe = vi.spyOn(live.session, "observeAgentMessagePromptOutcome");
+			const manager = live.sessionManager as unknown as { persistListeners: Set<unknown> };
+			const outcome = live.session as unknown as {
+				_agentMessageOutcomes: Map<
+					string,
+					{ deliveryListeners?: Set<unknown>; completionListeners?: Set<unknown> }
+				>;
+			};
+			const command = {
+				type: "worker_native_mesh_deliver_message",
+				targetActiveSessionId: "target",
+				expectedSessionId: live.session.sessionId,
+				message: "one entry",
+				sender: { sessionId: "sender" },
+				requestId: `nm1m-${"a".repeat(64)}`,
+				attemptToken: "S0",
+			} as const;
+			const id = `agentmsg_native-mesh:${command.requestId}`;
+			let control: Promise<void> | undefined;
+			try {
+				control = live.session.prompt("hold tool");
+				void control.catch(() => undefined);
+				await entered.promise;
+				await h.internals.receiveMeshMessage(h.client, command);
+				expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+				for (let i = 1; i <= 100; i++)
+					await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: `S${i}` });
+				expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+				expect(accept).toHaveBeenCalledTimes(1);
+				expect(observe).toHaveBeenCalledTimes(1);
+				expect(outcome._agentMessageOutcomes.get(id)?.deliveryListeners?.size).toBe(1);
+				expect(outcome._agentMessageOutcomes.get(id)?.completionListeners?.size).toBe(1);
+				expect(manager.persistListeners.size).toBe(2);
+				expect(h.socket.listenerCount("close")).toBe(1);
+				expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+				await expect(h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "" })).rejects.toThrow(
+					"Invalid native mesh delivery",
+				);
+				await expect(h.internals.receiveMeshMessage(h.client, { ...command, message: "conflict" })).rejects.toThrow(
+					"conflicts",
+				);
+				let finalToken = "S100";
+				let readAcks = () => h.frames().filter((f) => f.type === "native_mesh_message_persisted");
+				if (mode === "reconnect") {
+					h.socket.destroyed = true;
+					h.socket.emit("close");
+					expect(manager.persistListeners.size).toBe(1);
+					expect(h.socket.listenerCount("close")).toBe(0);
+					const writes: Buffer[] = [];
+					const socket = Object.assign(new EventEmitter(), {
+						destroyed: false,
+						write: (data: Buffer) => {
+							writes.push(data);
+							return true;
+						},
+						end: vi.fn(),
+					});
+					const client = { ...h.client, authenticated: false, socket } as unknown as DaemonSocketClient;
+					await h.internals.handleLine(
+						client,
+						JSON.stringify({
+							type: "worker_auth",
+							token: "token",
+							supervisorGeneration: "next",
+							supervisorPid: process.pid,
+							supervisorSocketPath: join(h.root, "supervisor.sock"),
+							agentMessageTransport: "native",
+						}),
+					);
+					finalToken = "fresh";
+					await h.internals.receiveMeshMessage(client, { ...command, attemptToken: finalToken });
+					readAcks = () =>
+						new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+							.push(Buffer.concat(writes))
+							.map((f) => JSON.parse(f.payload.toString("utf8")))
+							.filter((f) => f.type === "native_mesh_message_persisted");
+					expect(observe).toHaveBeenCalledTimes(1);
+				}
+				console.log(
+					"NATIVE_QUEUED",
+					JSON.stringify({
+						mode,
+						admissions: accept.mock.calls.length,
+						observers: observe.mock.calls.length,
+						persistListeners: manager.persistListeners.size,
+						outcomes: outcome._agentMessageOutcomes.size,
+					}),
+				);
+				const completed = live.session.waitForAgentMessagePromptCompletion(id);
+				release.resolve();
+				await control;
+				await completed;
+				live.sessionManager.flushNow();
+				const diskCount = readFileSync(live.session.sessionFile!, "utf8").split(`"id":"${id}"`).length - 1;
+				const acks = readAcks();
+				console.log(
+					"NATIVE_SETTLED",
+					JSON.stringify({
+						mode,
+						diskCount,
+						acks,
+						persistListeners: manager.persistListeners.size,
+						outcomes: outcome._agentMessageOutcomes.size,
+					}),
+				);
+				expect(diskCount).toBe(1);
+				expect(acks).toEqual([
+					{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: finalToken },
+				]);
+				expect(manager.persistListeners.size).toBe(1);
+				expect(outcome._agentMessageOutcomes.size).toBe(0);
+			} finally {
+				release.resolve();
+				if (control) await Promise.allSettled([control]);
+				vi.restoreAllMocks();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("native persisted-before-admission socket close leaves no orphan without retry", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		const gate = createDeferred();
+		const entered = createDeferred();
+		let accepted!: AgentSessionMessage;
+		const session = Object.assign(makeRuntimeSession(manager), {
+			acceptAgentMessagePrompt: async (_text: string, options: { customMessage: AgentSessionMessage }) => {
+				accepted = options.customMessage;
+				entered.resolve();
+				await gate.promise;
+			},
+			waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+			waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+			rejectAgentMessagePrompt: vi.fn(),
+			hasQueuedAgentMessage: () => false,
+			registerDisposeCallback: () => () => undefined,
+		});
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session,
+		} as ActiveSessionState["runtime"];
+		h.internals.getOrHydrateBoundSessionState = async () => state;
+		const internal = h.internals as unknown as {
+			nativeMeshObservers: WeakMap<AgentSession, Map<string, unknown>>;
+			nativeMeshIngress: Map<string, unknown>;
+		};
+		const managerInternal = manager as unknown as { persistListeners: Set<unknown> };
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"f1".repeat(32)}`,
+			attemptToken: "only",
+		} as const;
+		const first = h.internals.receiveMeshMessage(h.client, command);
+		void first.catch(() => undefined);
+		try {
+			await entered.promise;
+			manager.appendCustomMessageEntry("agent_message", "hello", true, accepted.details);
+			h.socket.destroyed = true;
+			h.socket.emit("close");
+			gate.resolve();
+			await Promise.allSettled([first]);
+			expect(internal.nativeMeshObservers.get(session)?.size ?? 0).toBe(0);
+			expect(internal.nativeMeshIngress.size).toBe(0);
+			expect(managerInternal.persistListeners.size).toBe(1);
+			expect(h.socket.listenerCount("close")).toBe(0);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+		} finally {
+			gate.resolve();
+			await Promise.allSettled([first]);
+		}
+	});
+
+	it("native persisted-before-admission retries retain only newest attempt observer", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		const gate = createDeferred();
+		const entered = createDeferred();
+		let accepted!: AgentSessionMessage;
+		const accept = vi.fn(async (_text: string, options: { customMessage: AgentSessionMessage }) => {
+			accepted = options.customMessage;
+			entered.resolve();
+			await gate.promise;
+		});
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				acceptAgentMessagePrompt: accept,
+				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+				rejectAgentMessagePrompt: vi.fn(),
+				hasQueuedAgentMessage: () => false,
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		h.internals.getOrHydrateBoundSessionState = async () => state;
+		const signals = Array.from({ length: 16 }, () => createDeferred());
+		const original = manager.onPersist.bind(manager);
+		let registrations = 0;
+		const persist = vi.spyOn(manager, "onPersist").mockImplementation((listener) => {
+			const stop = original(listener);
+			if (++registrations >= 2) signals[registrations - 2]?.resolve();
+			return stop;
+		});
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"e1".repeat(32)}`,
+			attemptToken: "S0",
+		} as const;
+		const attempts: Promise<void>[] = [];
+		const begin = (n: number) => {
+			const p = h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: `S${n}` });
+			void p.catch(() => undefined);
+			attempts.push(p);
+		};
+		try {
+			begin(0);
+			await entered.promise;
+			manager.appendCustomMessageEntry("agent_message", "hello", true, accepted.details);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			for (let i = 1; i <= 15; i++) {
+				begin(i);
+				await signals[i]?.promise;
+			}
+			expect(accept).toHaveBeenCalledTimes(1);
+			const managerInternals = manager as unknown as { persistListeners: Set<unknown> };
+			expect(managerInternals.persistListeners.size).toBe(2); // shared tracker + latest attempt
+			expect(h.socket.listenerCount("close")).toBe(1);
+			gate.resolve();
+			const results = await Promise.allSettled(attempts);
+			expect(results.at(-1)?.status).toBe("fulfilled");
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "S15" },
+			]);
+			expect(managerInternals.persistListeners.size).toBe(1);
+			expect(h.socket.listenerCount("close")).toBe(0);
+		} finally {
+			gate.resolve();
+			await Promise.allSettled(attempts);
+			persist.mockRestore();
+		}
+	});
+
+	it("native stale supervisor cannot hydrate after passive lookup returns", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const internal = h.internals as unknown as {
+			getOrHydrateBoundSessionState(target: string): Promise<ActiveSessionState>;
+			findPassiveRlmSubagent(target: string): Promise<unknown>;
+			hydratePassiveRlmSubagent(passive: unknown): Promise<ActiveSessionState>;
+		};
+		internal.getOrHydrateBoundSessionState = vi.fn(async () => {
+			throw new Error("not bound");
+		});
+		internal.findPassiveRlmSubagent = vi.fn(async () => {
+			entered.resolve();
+			await release.promise;
+			return {};
+		});
+		const hydrate = vi.fn(async () => {
+			throw new Error("stale hydration ran");
+		});
+		internal.hydratePassiveRlmSubagent = hydrate;
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "passive",
+			expectedSessionId: "session-passive",
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"d1".repeat(32)}`,
+			attemptToken: "old",
+		} as const;
+		const first = h.internals.receiveMeshMessage(h.client, command);
+		void first.catch(() => undefined);
+		try {
+			await entered.promise;
+			const socket = Object.assign(new EventEmitter(), {
+				destroyed: false,
+				write: (_data: Buffer) => true,
+				end: vi.fn(),
+			});
+			const client = { ...h.client, authenticated: false, socket } as unknown as DaemonSocketClient;
+			await h.internals.handleLine(
+				client,
+				JSON.stringify({
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "next",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(h.root, "supervisor.sock"),
+					agentMessageTransport: "native",
+				}),
+			);
+			expect(h.internals.supervisorClaims.has(h.client)).toBe(false);
+			release.resolve();
+			await expect(first).rejects.toThrow("Superseded native mesh attempt");
+			expect(hydrate).not.toHaveBeenCalled();
+		} finally {
+			release.resolve();
+			await Promise.allSettled([first]);
+		}
+	});
+
+	it("native old hydration cannot displace a newer supervisor claim", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+				rejectAgentMessagePrompt: vi.fn(),
+				hasQueuedAgentMessage: () => true,
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		let release!: (state: ActiveSessionState) => void;
+		const held = new Promise<ActiveSessionState>((resolve) => {
+			release = resolve;
+		});
+		h.internals.getOrHydrateBoundSessionState = vi.fn().mockReturnValueOnce(held).mockResolvedValue(state);
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"d".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const writes: Buffer[] = [];
+		const socket = Object.assign(new EventEmitter(), {
+			destroyed: false,
+			write: (data: Buffer) => {
+				writes.push(data);
+				return true;
+			},
+			end: vi.fn(),
+		});
+		const client = { ...h.client, authenticated: false, socket } as unknown as DaemonSocketClient;
+		const first = h.internals.receiveMeshMessage(h.client, command);
+		void first.catch(() => undefined);
+		try {
+			await h.internals.handleLine(
+				client,
+				JSON.stringify({
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "second",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(h.root, "supervisor.sock"),
+					agentMessageTransport: "native",
+				}),
+			);
+			expect(h.internals.supervisorClaims.has(h.client)).toBe(false);
+			expect(h.internals.supervisorClaims.has(client)).toBe(true);
+			await h.internals.receiveMeshMessage(client, { ...command, attemptToken: "new" });
+			release(state);
+			await expect(first).rejects.toThrow("Superseded native mesh attempt");
+			expect(state.runtime.session.rejectAgentMessagePrompt).not.toHaveBeenCalled();
+			manager.appendCustomMessageEntry("agent_message", "hello", true, {
+				id: `agentmsg_native-mesh:${command.requestId}`,
+			});
+			const frames = new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+				.push(Buffer.concat(writes))
+				.map((frame) => JSON.parse(frame.payload.toString("utf8")));
+			expect(frames.filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "new" },
+			]);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+		} finally {
+			release(state);
+			await Promise.allSettled([first]);
+		}
+	});
+
+	it.each(["claim-check", "alias"] as const)("native latest wire delivery survives reordered %s", async (phase) => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+				rejectAgentMessagePrompt: vi.fn(),
+				hasQueuedAgentMessage: () => true,
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		const blocked = createDeferred();
+		if (phase === "claim-check") {
+			let checks = 0;
+			h.internals.assertSupervisorClaimCurrent = async () => {
+				if (++checks === 1) await blocked.promise;
+				return "fingerprint";
+			};
+			h.internals.getOrHydrateBoundSessionState = async () => state;
+		} else {
+			let calls = 0;
+			h.internals.getOrHydrateBoundSessionState = async () => {
+				if (++calls === 1) await blocked.promise;
+				return state;
+			};
+		}
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"e".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const first = h.internals.handleLine(h.client, JSON.stringify(command));
+		try {
+			await h.internals.handleLine(
+				h.client,
+				JSON.stringify({
+					...command,
+					targetActiveSessionId: phase === "alias" ? "alias" : "target",
+					attemptToken: "new",
+				}),
+			);
+			blocked.resolve();
+			await first;
+			manager.appendCustomMessageEntry("agent_message", "hello", true, {
+				id: `agentmsg_native-mesh:${command.requestId}`,
+			});
+			const acks = h.frames().filter((f) => f.type === "native_mesh_message_persisted");
+			console.log("NATIVE_REORDER", JSON.stringify({ phase, acks }));
+			expect(acks).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "new" },
+			]);
+		} finally {
+			blocked.resolve();
+			await Promise.allSettled([first]);
+		}
+	});
+
+	it.each(["clear", "dispose"] as const)("native queued retry settles without entry on %s", async (mode) => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "hold",
+					label: "hold",
+					description: "gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"f".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const id = `agentmsg_native-mesh:${command.requestId}`;
+		const outcome = live.session as unknown as { _agentMessageOutcomes: Map<string, unknown> };
+		const manager = live.sessionManager as unknown as { persistListeners: Set<unknown> };
+		const control = live.session.prompt("hold");
+		void control.catch(() => undefined);
+		try {
+			await entered.promise;
+			await h.internals.receiveMeshMessage(h.client, command);
+			await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "new" });
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			if (mode === "clear") live.session.clearQueuedAgentMessages();
+			else live.session.dispose();
+			await Promise.resolve();
+			await Promise.resolve();
+			const frames = h
+				.frames()
+				.filter((f) => f.type === "native_mesh_message_dropped" || f.type === "native_mesh_message_persisted");
+			console.log(
+				"NATIVE_TERMINAL",
+				JSON.stringify({
+					mode,
+					frames,
+					outcomes: outcome._agentMessageOutcomes.size,
+					persistListeners: manager.persistListeners.size,
+					closeListeners: h.socket.listenerCount("close"),
+				}),
+			);
+			expect(frames).toEqual([
+				{
+					type: "native_mesh_message_dropped",
+					requestId: command.requestId,
+					attemptToken: "new",
+					reason: mode === "clear" ? "cleared" : "other",
+				},
+			]);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(0);
+			expect(outcome._agentMessageOutcomes.size).toBe(0);
+			expect(h.socket.listenerCount("close")).toBe(0);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([control]);
+			live.cleanup();
+		}
+	});
+
+	it("native ingress drops bogus target keys while a valid observer is retained", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+				rejectAgentMessagePrompt: vi.fn(),
+				hasQueuedAgentMessage: () => true,
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		Object.assign(h.internals, {
+			getOrHydrateBoundSessionState: async (target: string) => {
+				if (target !== "target") throw new Error("unknown target");
+				return state;
+			},
+			findPassiveRlmSubagent: async () => undefined,
+		});
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"1".repeat(64)}`,
+			attemptToken: "valid",
+		} as const;
+		await h.internals.receiveMeshMessage(h.client, command);
+		const ingress = h.internals as unknown as {
+			nativeMeshIngress: Map<string, { pending: number; observing: number }>;
+		};
+		expect(ingress.nativeMeshIngress.size).toBe(1);
+		const group = [...ingress.nativeMeshIngress.values()][0];
+		for (let i = 0; i < 100; i++) {
+			await expect(
+				h.internals.receiveMeshMessage(h.client, {
+					...command,
+					targetActiveSessionId: `bogus-${i}`,
+					attemptToken: `bad-${i}`,
+				}),
+			).rejects.toThrow("unknown target");
+			expect(ingress.nativeMeshIngress.size).toBe(1);
+			expect(group.pending).toBe(0);
+			expect(group.observing).toBe(1);
+		}
+		manager.appendCustomMessageEntry("agent_message", "hello", true, {
+			id: `agentmsg_native-mesh:${command.requestId}`,
+		});
+		expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+			{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "valid" },
+		]);
+		expect(ingress.nativeMeshIngress.size).toBe(0);
+	});
+
+	it("native retry during message_start does not register a late delivery waiter", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const toolStarted = createDeferred();
+		const releaseTool = createDeferred();
+		const messageStarted = createDeferred();
+		const releaseMessage = createDeferred();
+		const requestId = `nm1m-${"2".repeat(64)}`;
+		const id = `agentmsg_native-mesh:${requestId}`;
+		const live = await createHarness({
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_start", async (event) => {
+						if (event.message.role === "custom" && (event.message.details as { id?: string })?.id === id) {
+							messageStarted.resolve();
+							await releaseMessage.promise;
+						}
+					});
+				},
+			],
+			tools: [
+				{
+					name: "hold",
+					label: "hold",
+					description: "gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						toolStarted.resolve();
+						await releaseTool.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("tool done"),
+			fauxAssistantMessage("done"),
+		]);
+		const observe = vi.spyOn(live.session, "observeAgentMessagePromptOutcome");
+		const outcomes = live.session as unknown as {
+			_agentMessageOutcomes: Map<
+				string,
+				{
+					delivery?: unknown;
+					completion?: unknown;
+					deliveryListeners?: Set<unknown>;
+					completionListeners?: Set<unknown>;
+				}
+			>;
+		};
+		const cmd = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId,
+			attemptToken: "old",
+		} as const;
+		const control = live.session.prompt("hold");
+		void control.catch(() => undefined);
+		try {
+			await toolStarted.promise;
+			await h.internals.receiveMeshMessage(h.client, cmd);
+			const completed = live.session.waitForAgentMessagePromptCompletion(id);
+			releaseTool.resolve();
+			await messageStarted.promise;
+			expect(
+				live.sessionManager
+					.getEntries()
+					.some((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toBe(false);
+			expect(outcomes._agentMessageOutcomes.get(id)?.delivery).toBeUndefined();
+			await h.internals.receiveMeshMessage(h.client, { ...cmd, attemptToken: "new" });
+			expect(observe).toHaveBeenCalledTimes(1);
+			expect(outcomes._agentMessageOutcomes.get(id)?.deliveryListeners?.size ?? 0).toBe(0);
+			expect(outcomes._agentMessageOutcomes.get(id)?.completionListeners?.size).toBe(1);
+			expect(outcomes._agentMessageOutcomes.get(id)?.delivery).toBeUndefined();
+			releaseMessage.resolve();
+			await control;
+			await completed;
+			live.sessionManager.flushNow();
+			expect(outcomes._agentMessageOutcomes.size).toBe(0);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId, attemptToken: "new" },
+			]);
+		} finally {
+			releaseTool.resolve();
+			releaseMessage.resolve();
+			await Promise.allSettled([control]);
+			vi.restoreAllMocks();
+			live.cleanup();
+		}
+	});
+
+	it("native pending admission shares terminal failure with newest retry", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		const admitting = createDeferred();
+		const entered = createDeferred();
+		const observed = createDeferred();
+		const failure = createDeferred();
+		const completion = createDeferred();
+		const accept = vi.fn(async () => {
+			entered.resolve();
+			await admitting.promise;
+		});
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				acceptAgentMessagePrompt: accept,
+				waitForAgentMessagePromptDelivery: () => failure.promise,
+				waitForAgentMessagePromptCompletion: () => completion.promise,
+				rejectAgentMessagePrompt: vi.fn(),
+				hasQueuedAgentMessage: () => false,
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		h.internals.getOrHydrateBoundSessionState = async () => state;
+		const onPersist = manager.onPersist.bind(manager);
+		let count = 0;
+		const persist = vi.spyOn(manager, "onPersist").mockImplementation((listener) => {
+			const off = onPersist(listener);
+			if (++count === 3) observed.resolve();
+			return off;
+		});
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"3".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const first = h.internals.receiveMeshMessage(h.client, command);
+		void first.catch(() => undefined);
+		let second: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			failure.reject(new Error("delivery failed before admission"));
+			await Promise.resolve();
+			second = h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "new" });
+			void second.catch(() => undefined);
+			await observed.promise;
+			expect(accept).toHaveBeenCalledTimes(1);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_dropped")).toEqual([]);
+			admitting.resolve();
+			await Promise.allSettled([first, second]);
+			const dropped = h.frames().filter((f) => f.type === "native_mesh_message_dropped");
+			console.log("NATIVE_PENDING_FAILURE", JSON.stringify(dropped));
+			expect(dropped).toEqual([
+				{ type: "native_mesh_message_dropped", requestId: command.requestId, attemptToken: "new", reason: "other" },
+			]);
+		} finally {
+			admitting.resolve();
+			completion.resolve();
+			await Promise.allSettled([first, ...(second ? [second] : [])]);
+			persist.mockRestore();
+		}
+	});
+
+	it("native terminal completion without entry detaches listener without cancelling external waiter", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "hold",
+					label: "hold",
+					description: "gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("tool done"),
+			fauxAssistantMessage("message done"),
+		]);
+		const cmd = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"6".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const id = `agentmsg_native-mesh:${cmd.requestId}`;
+		const internal = live.session as unknown as {
+			_agentMessageOutcomes: Map<
+				string,
+				{
+					delivery?: unknown;
+					completion?: unknown;
+					deliveryListeners?: Set<unknown>;
+					completionListeners?: Set<unknown>;
+				}
+			>;
+			_settleAgentMessage(id: string, leg: "completion"): void;
+		};
+		const control = live.session.prompt("hold");
+		void control.catch(() => undefined);
+		try {
+			await entered.promise;
+			await h.internals.receiveMeshMessage(h.client, cmd);
+			expect(internal._agentMessageOutcomes.get(id)?.deliveryListeners?.size).toBe(1);
+			expect(internal._agentMessageOutcomes.get(id)?.completionListeners?.size).toBe(1);
+			const externalDelivery = live.session.waitForAgentMessagePromptDelivery(id);
+			void externalDelivery.catch(() => undefined);
+			const externalDeferred = internal._agentMessageOutcomes.get(id)?.delivery;
+			const completed = live.session.waitForAgentMessagePromptCompletion(id);
+			h.socket.destroyed = true;
+			h.socket.emit("close");
+			// Inject the session terminal-completion-without-entry edge directly.
+			// This uses the actual per-ID deferreds rather than stand-in promises.
+			internal._settleAgentMessage(id, "completion");
+			await completed;
+			await Promise.resolve();
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(0);
+			expect(internal._agentMessageOutcomes.get(id)?.delivery).toBe(externalDeferred);
+			expect(internal._agentMessageOutcomes.get(id)?.deliveryListeners?.size ?? 0).toBe(0);
+			expect(internal._agentMessageOutcomes.get(id)?.completionListeners?.size ?? 0).toBe(0);
+			expect(
+				h
+					.frames()
+					.filter((f) => f.type === "native_mesh_message_dropped" || f.type === "native_mesh_message_persisted"),
+			).toEqual([]);
+		} finally {
+			live.session.clearQueuedAgentMessages();
+			release.resolve();
+			await Promise.allSettled([control]);
+			live.cleanup();
+		}
+	});
+
+	it("native same request ID remains isolated across two real sessions", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const enteredA = createDeferred();
+		const enteredB = createDeferred();
+		const releaseA = createDeferred();
+		const releaseB = createDeferred();
+		const makeLive = (
+			provider: string,
+			entered: ReturnType<typeof createDeferred>,
+			release: ReturnType<typeof createDeferred>,
+		) =>
+			createHarness({
+				persistSession: true,
+				provider,
+				tools: [
+					{
+						name: "hold",
+						label: "hold",
+						description: "gate",
+						parameters: Type.Object({}),
+						execute: async () => {
+							entered.resolve();
+							await release.promise;
+							return { content: [], details: {} };
+						},
+					},
+				],
+			});
+		const a = await makeLive("native-cross-a", enteredA, releaseA);
+		const b = await makeLive("native-cross-b", enteredB, releaseB);
+		const stateA = makeState("target-a");
+		const stateB = makeState("target-b");
+		stateA.runtime = { ...stateA.runtime, session: a.session } as ActiveSessionState["runtime"];
+		stateB.runtime = { ...stateB.runtime, session: b.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target-a", stateA);
+		h.internals.sessions.set("target-b", stateB);
+		for (const live of [a, b])
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("tool done"),
+				fauxAssistantMessage("message done"),
+			]);
+		const requestId = `nm1m-${"c1".repeat(32)}`;
+		const id = `agentmsg_native-mesh:${requestId}`;
+		const common = {
+			type: "worker_native_mesh_deliver_message",
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId,
+		} as const;
+		const runA = a.session.prompt("hold");
+		const runB = b.session.prompt("hold");
+		void runA.catch(() => undefined);
+		void runB.catch(() => undefined);
+		try {
+			await Promise.all([enteredA.promise, enteredB.promise]);
+			await h.internals.receiveMeshMessage(h.client, {
+				...common,
+				targetActiveSessionId: "target-a",
+				expectedSessionId: a.session.sessionId,
+				attemptToken: "a",
+			});
+			await h.internals.receiveMeshMessage(h.client, {
+				...common,
+				targetActiveSessionId: "target-b",
+				expectedSessionId: b.session.sessionId,
+				attemptToken: "b",
+			});
+			expect(a.session.hasQueuedAgentMessage(id)).toBe(true);
+			expect(b.session.hasQueuedAgentMessage(id)).toBe(true);
+			a.session.clearQueuedAgentMessages();
+			await Promise.resolve();
+			expect(a.session.hasQueuedAgentMessage(id)).toBe(false);
+			expect(b.session.hasQueuedAgentMessage(id)).toBe(true);
+			const completed = b.session.waitForAgentMessagePromptCompletion(id);
+			releaseA.resolve();
+			releaseB.resolve();
+			await Promise.all([runA, runB, completed]);
+			a.sessionManager.flushNow();
+			b.sessionManager.flushNow();
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_dropped")).toEqual([
+				{ type: "native_mesh_message_dropped", requestId, attemptToken: "a", reason: "cleared" },
+			]);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId, attemptToken: "b" },
+			]);
+			expect(
+				a.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(0);
+			expect(
+				b.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(1);
+		} finally {
+			releaseA.resolve();
+			releaseB.resolve();
+			await Promise.allSettled([runA, runB]);
+			a.cleanup();
+			b.cleanup();
+		}
+	});
+
+	it("native throwing drop write retires old custody before changed-payload reconnect", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "hold",
+					label: "hold",
+					description: "gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("tool done"),
+			fauxAssistantMessage("message done"),
+		]);
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "old payload",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"b1".repeat(32)}`,
+			attemptToken: "old",
+		} as const;
+		const id = `agentmsg_native-mesh:${command.requestId}`;
+		const internal = h.internals as unknown as {
+			nativeMeshFingerprints: WeakMap<AgentSession, Map<string, string>>;
+			meshMessageIds: WeakMap<AgentSession, Set<string>>;
+		};
+		const control = live.session.prompt("hold");
+		void control.catch(() => undefined);
+		try {
+			await entered.promise;
+			await h.internals.receiveMeshMessage(h.client, command);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			const throws = vi.spyOn(h.socket, "write").mockImplementation(() => {
+				throw new Error("drop write failed");
+			});
+			live.session.clearQueuedAgentMessages();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(throws).toHaveBeenCalledOnce();
+			expect(internal.nativeMeshFingerprints.get(live.session)?.has(id) ?? false).toBe(false);
+			expect(internal.meshMessageIds.get(live.session)?.has(id) ?? false).toBe(false);
+			h.socket.destroyed = true;
+			h.socket.emit("close");
+			const writes: Buffer[] = [];
+			const socket = Object.assign(new EventEmitter(), {
+				destroyed: false,
+				write: (data: Buffer) => {
+					writes.push(data);
+					return true;
+				},
+				end: vi.fn(),
+			});
+			const client = { ...h.client, authenticated: false, socket } as unknown as DaemonSocketClient;
+			await h.internals.handleLine(
+				client,
+				JSON.stringify({
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "next",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(h.root, "supervisor.sock"),
+					agentMessageTransport: "native",
+				}),
+			);
+			await h.internals.receiveMeshMessage(client, { ...command, message: "new payload", attemptToken: "new" });
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			const completed = live.session.waitForAgentMessagePromptCompletion(id);
+			release.resolve();
+			await control;
+			await completed;
+			live.sessionManager.flushNow();
+			const frames = new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+				.push(Buffer.concat(writes))
+				.map((f) => JSON.parse(f.payload.toString("utf8")));
+			expect(frames.filter((f) => f.type === "native_mesh_message_dropped")).toEqual([]);
+			expect(frames.filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "new" },
+			]);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(1);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([control]);
+			vi.restoreAllMocks();
+			live.cleanup();
+		}
+	});
+
+	it("native paused queue is cleared and retry cannot restart it until resume", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "hold",
+					label: "hold",
+					description: "gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("tool done"),
+			fauxAssistantMessage("message done"),
+		]);
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"a1".repeat(32)}`,
+			attemptToken: "old",
+		} as const;
+		const id = `agentmsg_native-mesh:${command.requestId}`;
+		const daemon = h.internals as unknown as {
+			agentMessagesPaused: boolean;
+			clearQueuedAgentSessionMessagesForAllStates(): Promise<void>;
+		};
+		const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt");
+		const control = live.session.prompt("hold");
+		void control.catch(() => undefined);
+		try {
+			await entered.promise;
+			await h.internals.receiveMeshMessage(h.client, command);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			// These are the two relevant operations in agent_messages_pause.
+			daemon.agentMessagesPaused = true;
+			await daemon.clearQueuedAgentSessionMessagesForAllStates();
+			await Promise.resolve();
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(false);
+			await expect(h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "paused" })).rejects.toThrow(
+				"Agent messaging is paused",
+			);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(false);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(0);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			daemon.agentMessagesPaused = false;
+			await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "resumed" });
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			const completed = live.session.waitForAgentMessagePromptCompletion(id);
+			release.resolve();
+			await control;
+			await completed;
+			live.sessionManager.flushNow();
+			expect(accept).toHaveBeenCalledTimes(3);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "resumed" },
+			]);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([control]);
+			accept.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it("native retries cannot admit while pause wins a pending admission", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const live = await createHarness({ persistSession: true });
+		const fence = createDeferred();
+		const entered = createDeferred();
+		const observed = createDeferred();
+		Object.assign(live.session, { _sessionActionCommitTail: fence.promise });
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		const originalAccept = live.session.acceptAgentMessagePrompt.bind(live.session);
+		const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt").mockImplementation((text, options) => {
+			const promise = originalAccept(text, options);
+			entered.resolve();
+			return promise;
+		});
+		const originalPersist = live.sessionManager.onPersist.bind(live.sessionManager);
+		let registrations = 0;
+		const persist = vi.spyOn(live.sessionManager, "onPersist").mockImplementation((listener) => {
+			const stop = originalPersist(listener);
+			if (++registrations === 3) observed.resolve();
+			return stop;
+		});
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"9".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const id = `agentmsg_native-mesh:${command.requestId}`;
+		const first = h.internals.receiveMeshMessage(h.client, command);
+		void first.catch(() => undefined);
+		let second: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			second = h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "new" });
+			void second.catch(() => undefined);
+			await observed.promise;
+			(h.internals as unknown as { agentMessagesPaused: boolean }).agentMessagesPaused = true;
+			fence.resolve();
+			const results = await Promise.allSettled([first, second]);
+			expect(results.map((r) => r.status)).toEqual(["rejected", "rejected"]);
+			for (const result of results) {
+				if (result.status === "rejected") expect(String(result.reason)).toContain("Agent messaging is paused");
+			}
+			expect(accept).toHaveBeenCalledTimes(1);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(false);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(0);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			(h.internals as unknown as { agentMessagesPaused: boolean }).agentMessagesPaused = false;
+			live.setResponses([fauxAssistantMessage("done")]);
+			const completed = live.session.waitForAgentMessagePromptCompletion(id);
+			await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "resumed" });
+			await completed;
+			live.sessionManager.flushNow();
+			expect(accept).toHaveBeenCalledTimes(2);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "resumed" },
+			]);
+		} finally {
+			fence.resolve();
+			await Promise.allSettled([first, ...(second ? [second] : [])]);
+			accept.mockRestore();
+			persist.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it("native receipt write failure preserves queued custody through reconnect", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "hold",
+					label: "hold",
+					description: "gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("tool done"),
+			fauxAssistantMessage("message done"),
+		]);
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"8".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const id = `agentmsg_native-mesh:${command.requestId}`;
+		const outcome = live.session as unknown as {
+			_agentMessageOutcomes: Map<string, { deliveryListeners?: Set<unknown>; completionListeners?: Set<unknown> }>;
+		};
+		const internal = h.internals as unknown as {
+			writeWorkerSuccess: (...args: never[]) => void;
+			nativeMeshFingerprints: WeakMap<AgentSession, Map<string, string>>;
+		};
+		const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt");
+		const write = vi.spyOn(internal, "writeWorkerSuccess").mockImplementationOnce(() => {
+			throw new Error("receipt write failed");
+		});
+		const control = live.session.prompt("hold");
+		void control.catch(() => undefined);
+		try {
+			await entered.promise;
+			await expect(h.internals.receiveMeshMessage(h.client, command)).rejects.toThrow("receipt write failed");
+			write.mockRestore();
+			expect(accept).toHaveBeenCalledTimes(1);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			expect(outcome._agentMessageOutcomes.get(id)?.deliveryListeners?.size).toBe(1);
+			expect(outcome._agentMessageOutcomes.get(id)?.completionListeners?.size).toBe(1);
+			expect(internal.nativeMeshFingerprints.get(live.session)?.has(id)).toBe(true);
+			h.socket.destroyed = true;
+			h.socket.emit("close");
+			const writes: Buffer[] = [];
+			const socket = Object.assign(new EventEmitter(), {
+				destroyed: false,
+				write: (data: Buffer) => {
+					writes.push(data);
+					return true;
+				},
+				end: vi.fn(),
+			});
+			const client = { ...h.client, authenticated: false, socket } as unknown as DaemonSocketClient;
+			await h.internals.handleLine(
+				client,
+				JSON.stringify({
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "next",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(h.root, "supervisor.sock"),
+					agentMessageTransport: "native",
+				}),
+			);
+			await h.internals.receiveMeshMessage(client, { ...command, attemptToken: "new" });
+			expect(accept).toHaveBeenCalledTimes(1);
+			const completed = live.session.waitForAgentMessagePromptCompletion(id);
+			release.resolve();
+			await control;
+			await completed;
+			live.sessionManager.flushNow();
+			const frames = new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+				.push(Buffer.concat(writes))
+				.map((f) => JSON.parse(f.payload.toString("utf8")));
+			expect(frames.filter((f) => f.type === "native_mesh_message_dropped")).toEqual([]);
+			expect(frames.filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "new" },
+			]);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(1);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([control]);
+			write.mockRestore();
+			accept.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it("native successful old admission cannot drop a newer adopted retry", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const live = await createHarness({ persistSession: true });
+		const fence = createDeferred();
+		const entered = createDeferred();
+		const observed = createDeferred();
+		Object.assign(live.session, { _sessionActionCommitTail: fence.promise });
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([fauxAssistantMessage("done")]);
+		const originalAccept = live.session.acceptAgentMessagePrompt.bind(live.session);
+		const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt").mockImplementation((text, options) => {
+			const promise = originalAccept(text, options);
+			entered.resolve();
+			return promise;
+		});
+		const originalPersist = live.sessionManager.onPersist.bind(live.sessionManager);
+		let registrations = 0;
+		const persist = vi.spyOn(live.sessionManager, "onPersist").mockImplementation((listener) => {
+			const stop = originalPersist(listener);
+			if (++registrations === 3) observed.resolve();
+			return stop;
+		});
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"7".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const id = `agentmsg_native-mesh:${command.requestId}`;
+		const first = h.internals.receiveMeshMessage(h.client, command);
+		void first.catch(() => undefined);
+		let second: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			second = h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "new" });
+			void second.catch(() => undefined);
+			await observed.promise;
+			expect(accept).toHaveBeenCalledTimes(1);
+			const completion = live.session.waitForAgentMessagePromptCompletion(id);
+			fence.resolve();
+			const results = await Promise.allSettled([first, second]);
+			expect(results[0].status).toBe("rejected");
+			expect(results[1].status).toBe("fulfilled");
+			await completion;
+			live.sessionManager.flushNow();
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_dropped")).toEqual([]);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "new" },
+			]);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(1);
+		} finally {
+			fence.resolve();
+			await Promise.allSettled([first, ...(second ? [second] : [])]);
+			accept.mockRestore();
+			persist.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it("native stale delivery reaction cannot affect a real same-ID re-admission", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const oldRejected = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "hold",
+					label: "hold",
+					description: "gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("tool done"),
+			fauxAssistantMessage("message done"),
+		]);
+		const cmd = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"5".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const id = `agentmsg_native-mesh:${cmd.requestId}`;
+		const originalObserve = live.session.observeAgentMessagePromptOutcome.bind(live.session);
+		let calls = 0;
+		let oldReaction: (() => void) | undefined;
+		const deliverySpy = vi
+			.spyOn(live.session, "observeAgentMessagePromptOutcome")
+			.mockImplementation((messageId, listener) => {
+				if (++calls !== 1) return originalObserve(messageId, listener);
+				return originalObserve(messageId, (leg, error) => {
+					if (leg === "delivery") {
+						oldReaction = () => listener(leg, error);
+						oldRejected.resolve();
+					} else listener(leg, error);
+				});
+			});
+		const control = live.session.prompt("hold");
+		void control.catch(() => undefined);
+		try {
+			await entered.promise;
+			await h.internals.receiveMeshMessage(h.client, cmd);
+			h.socket.destroyed = true;
+			h.socket.emit("close");
+			live.session.clearQueuedAgentMessages();
+			await oldRejected.promise;
+			// Let the real completion rejection retire the old generation. The delivery
+			// reaction above stays gated and will run only after the new admission.
+			await Promise.resolve();
+			await Promise.resolve();
+			const writes: Buffer[] = [];
+			const socket = Object.assign(new EventEmitter(), {
+				destroyed: false,
+				write: (data: Buffer) => {
+					writes.push(data);
+					return true;
+				},
+				end: vi.fn(),
+			});
+			const client = { ...h.client, authenticated: false, socket } as unknown as DaemonSocketClient;
+			await h.internals.handleLine(
+				client,
+				JSON.stringify({
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "next",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(h.root, "supervisor.sock"),
+					agentMessageTransport: "native",
+				}),
+			);
+			await h.internals.receiveMeshMessage(client, { ...cmd, attemptToken: "new" });
+			expect(calls).toBe(2);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			const outcomes = live.session as unknown as { _agentMessageOutcomes: Map<string, unknown> };
+			const newOutcome = outcomes._agentMessageOutcomes.get(id);
+			expect(newOutcome).toBeDefined();
+			if (!oldReaction) throw new Error("Missing old delivery reaction");
+			oldReaction();
+			expect(outcomes._agentMessageOutcomes.get(id)).toBe(newOutcome);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			const completed = live.session.waitForAgentMessagePromptCompletion(id);
+			release.resolve();
+			await control;
+			await completed;
+			live.sessionManager.flushNow();
+			const frames = new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+				.push(Buffer.concat(writes))
+				.map((f) => JSON.parse(f.payload.toString("utf8")));
+			expect(frames.filter((f) => f.type === "native_mesh_message_dropped")).toEqual([]);
+			expect(frames.filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: cmd.requestId, attemptToken: "new" },
+			]);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(1);
+			expect(outcomes._agentMessageOutcomes.has(id)).toBe(false);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([control]);
+			deliverySpy.mockRestore();
+			live.cleanup();
+		}
+	});
+
+	it("native disconnect and clear allow same-ID new payload admission", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "hold",
+					label: "hold",
+					description: "gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("tool done"),
+			fauxAssistantMessage("message done"),
+		]);
+		const cmd = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "old payload",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"4".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const id = `agentmsg_native-mesh:${cmd.requestId}`;
+		const internals = h.internals as unknown as {
+			nativeMeshFingerprints: WeakMap<AgentSession, Map<string, string>>;
+			meshMessageIds: WeakMap<AgentSession, Set<string>>;
+		};
+		const control = live.session.prompt("hold");
+		void control.catch(() => undefined);
+		try {
+			await entered.promise;
+			await h.internals.receiveMeshMessage(h.client, cmd);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			h.socket.destroyed = true;
+			h.socket.emit("close");
+			live.session.clearQueuedAgentMessages();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(
+				h
+					.frames()
+					.filter((f) => f.type === "native_mesh_message_dropped" || f.type === "native_mesh_message_persisted"),
+			).toEqual([]);
+			expect(internals.nativeMeshFingerprints.get(live.session)?.has(id) ?? false).toBe(false);
+			expect(internals.meshMessageIds.get(live.session)?.has(id) ?? false).toBe(false);
+			const writes: Buffer[] = [];
+			const socket = Object.assign(new EventEmitter(), {
+				destroyed: false,
+				write: (data: Buffer) => {
+					writes.push(data);
+					return true;
+				},
+				end: vi.fn(),
+			});
+			const client = { ...h.client, authenticated: false, socket } as unknown as DaemonSocketClient;
+			await h.internals.handleLine(
+				client,
+				JSON.stringify({
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "next",
+					supervisorPid: process.pid,
+					supervisorSocketPath: join(h.root, "supervisor.sock"),
+					agentMessageTransport: "native",
+				}),
+			);
+			await h.internals.receiveMeshMessage(client, { ...cmd, message: "new payload", attemptToken: "new" });
+			const completed = live.session.waitForAgentMessagePromptCompletion(id);
+			release.resolve();
+			await control;
+			await completed;
+			live.sessionManager.flushNow();
+			const frames = new PrivateFrameDecoder(isDaemonWorkerFrameHeader)
+				.push(Buffer.concat(writes))
+				.map((f) => JSON.parse(f.payload.toString("utf8")));
+			expect(frames.filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+				{ type: "native_mesh_message_persisted", requestId: cmd.requestId, attemptToken: "new" },
+			]);
+			const entries = live.sessionManager
+				.getEntries()
+				.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id);
+			expect(entries).toHaveLength(1);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([control]);
+			live.cleanup();
+		}
+	});
+
 	it("native mesh only confirms after persistence and rejects conflicting retries", async () => {
 		const h = harness();
 		await h.authenticate("native");
@@ -4508,6 +6224,106 @@ describe("mesh worker persistence", () => {
 		await expect(h.internals.receiveMeshMessage(h.client, { ...command, message: "different" })).rejects.toThrow(
 			"conflicts",
 		);
+	});
+
+	it("bounds native retry observations and confirms only the current token", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		let accepted!: AgentSessionMessage;
+		const delivery = vi.fn(() => new Promise<void>(() => undefined));
+		const completion = vi.fn(() => new Promise<void>(() => undefined));
+		const accept = vi.fn(async (_: string, options: { customMessage: AgentSessionMessage }) => {
+			accepted = options.customMessage;
+		});
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				acceptAgentMessagePrompt: accept,
+				waitForAgentMessagePromptDelivery: delivery,
+				waitForAgentMessagePromptCompletion: completion,
+				rejectAgentMessagePrompt: vi.fn(),
+				hasQueuedAgentMessage: vi.fn().mockReturnValueOnce(false).mockReturnValue(true),
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		h.internals.getOrHydrateBoundSessionState = async () => state;
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"b".repeat(64)}`,
+			attemptToken: "attempt-0",
+		} as const;
+		const baseline = h.socket.listenerCount("close");
+		for (let i = 0; i < 200; i++) {
+			await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: `attempt-${i}` });
+			expect(h.socket.listenerCount("close")).toBe(baseline + 1);
+		}
+		expect(delivery).toHaveBeenCalledTimes(1);
+		expect(completion).toHaveBeenCalledTimes(1);
+		expect(accept).toHaveBeenCalledTimes(1);
+		await expect(h.internals.receiveMeshMessage(h.client, { ...command, message: "conflict" })).rejects.toThrow(
+			"conflicts",
+		);
+		manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details);
+		const persisted = h.frames().filter((frame) => frame.type === "native_mesh_message_persisted");
+		expect(persisted).toEqual([
+			{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "attempt-199" },
+		]);
+		expect(h.socket.listenerCount("close")).toBe(baseline);
+	});
+
+	it("does not let an older native hydration supersede a newer attempt", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
+		manager.appendMessage(fauxAssistantMessage("ready"));
+		const state = makeState("target");
+		state.runtime = {
+			...state.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: Object.assign(makeRuntimeSession(manager), {
+				waitForAgentMessagePromptDelivery: () => new Promise<void>(() => undefined),
+				waitForAgentMessagePromptCompletion: () => new Promise<void>(() => undefined),
+				rejectAgentMessagePrompt: vi.fn(),
+				hasQueuedAgentMessage: () => true,
+				registerDisposeCallback: () => () => undefined,
+			}),
+		} as unknown as ActiveSessionState["runtime"];
+		let release!: (state: ActiveSessionState) => void;
+		const slow = new Promise<ActiveSessionState>((resolve) => {
+			release = resolve;
+		});
+		h.internals.getOrHydrateBoundSessionState = vi.fn().mockReturnValueOnce(slow).mockResolvedValue(state);
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: manager.getSessionId(),
+			message: "hello",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"c".repeat(64)}`,
+			attemptToken: "old",
+		} as const;
+		const old = h.internals.receiveMeshMessage(h.client, command);
+		await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "new" });
+		release(state);
+		await expect(old).rejects.toThrow("Superseded native mesh attempt");
+		expect(state.runtime.session.rejectAgentMessagePrompt).not.toHaveBeenCalled();
+		manager.appendCustomMessageEntry("agent_message", "hello", true, {
+			id: `agentmsg_native-mesh:${command.requestId}`,
+		});
+		expect(
+			h
+				.frames()
+				.filter((frame) => frame.type === "native_mesh_message_persisted")
+				.map((frame) => frame.attemptToken),
+		).toEqual(["new"]);
 	});
 
 	it("native mesh does not confirm an fsync failure and retries without another admission", async () => {

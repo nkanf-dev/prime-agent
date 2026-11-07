@@ -1006,9 +1006,13 @@ interface AgentMessageDeferred {
 	reject: (error: Error) => void;
 }
 
+type AgentMessageOutcomeListener = (leg: "delivery" | "completion", error?: Error) => void;
+
 interface AgentMessageOutcome {
 	delivery?: AgentMessageDeferred;
 	completion?: AgentMessageDeferred;
+	deliveryListeners?: Set<AgentMessageOutcomeListener>;
+	completionListeners?: Set<AgentMessageOutcomeListener>;
 }
 
 function createAgentMessageDeferred(): AgentMessageDeferred {
@@ -4471,6 +4475,44 @@ export class AgentSession {
 		return outcome.delivery.promise;
 	}
 
+	/** Observe this ID without owning or cancelling any other consumer's deferred promise. */
+	observeAgentMessagePromptOutcome(agentMessageId: string, listener: AgentMessageOutcomeListener): () => void {
+		let active = true;
+		const guardedListener: AgentMessageOutcomeListener = (leg, error) => {
+			if (!active) return;
+			try {
+				listener(leg, error);
+			} catch {
+				// An observer cannot interfere with the session or other consumers.
+			}
+		};
+		if (this._disposed || this._disposing) {
+			queueMicrotask(() => guardedListener("delivery", new Error("Session disposed before prompt delivery.")));
+			queueMicrotask(() => guardedListener("completion", new Error("Session disposed before prompt completion.")));
+			return () => {
+				active = false;
+			};
+		}
+		const outcome = this._agentMessageOutcome(agentMessageId);
+		outcome.deliveryListeners ??= new Set();
+		outcome.completionListeners ??= new Set();
+		outcome.deliveryListeners.add(guardedListener);
+		outcome.completionListeners.add(guardedListener);
+		return () => {
+			active = false;
+			outcome.deliveryListeners?.delete(guardedListener);
+			outcome.completionListeners?.delete(guardedListener);
+			if (
+				this._agentMessageOutcomes.get(agentMessageId) === outcome &&
+				!outcome.delivery &&
+				!outcome.completion &&
+				!outcome.deliveryListeners?.size &&
+				!outcome.completionListeners?.size
+			)
+				this._agentMessageOutcomes.delete(agentMessageId);
+		};
+	}
+
 	hasQueuedAgentMessage(agentMessageId: string): boolean {
 		return this._actionStore.unfinishedActions().some((action) => action.agentMessageId === agentMessageId);
 	}
@@ -4494,13 +4536,23 @@ export class AgentSession {
 		const outcome = this._agentMessageOutcomes.get(agentMessageId);
 		if (!outcome) return;
 		const deferred = outcome[leg];
-		if (!deferred) return;
+		const listenerKey = leg === "delivery" ? "deliveryListeners" : "completionListeners";
+		const listeners = outcome[listenerKey];
 		outcome[leg] = undefined;
-		if (!outcome.delivery && !outcome.completion) {
+		outcome[listenerKey] = undefined;
+		if (
+			!outcome.delivery &&
+			!outcome.completion &&
+			!outcome.deliveryListeners?.size &&
+			!outcome.completionListeners?.size
+		) {
 			this._agentMessageOutcomes.delete(agentMessageId);
 		}
-		if (error) deferred.reject(error);
-		else deferred.resolve();
+		if (deferred) {
+			if (error) deferred.reject(error);
+			else deferred.resolve();
+		}
+		if (listeners) for (const listener of listeners) queueMicrotask(() => listener(leg, error));
 	}
 
 	private _rejectAgentMessage(agentMessageId: string | undefined, error: Error): void {
@@ -5320,8 +5372,10 @@ export class AgentSession {
 			const completionError = new Error("Session disposed before prompt completion.");
 			this._rejectQueuedAgentMessageDeliveries(deliveryError, completionError);
 			for (const [agentMessageId, outcome] of this._agentMessageOutcomes) {
-				if (outcome.delivery) this._settleAgentMessage(agentMessageId, "delivery", deliveryError);
-				if (outcome.completion) this._settleAgentMessage(agentMessageId, "completion", completionError);
+				if (outcome.delivery || outcome.deliveryListeners?.size)
+					this._settleAgentMessage(agentMessageId, "delivery", deliveryError);
+				if (outcome.completion || outcome.completionListeners?.size)
+					this._settleAgentMessage(agentMessageId, "completion", completionError);
 			}
 			this._cancelSessionActions(() => true, deliveryError);
 			this.agent.clearAllQueues();

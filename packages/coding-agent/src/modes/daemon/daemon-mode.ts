@@ -473,6 +473,13 @@ export async function runDaemonMode(options: DaemonModeOptions): Promise<never> 
 	return new Promise(() => {});
 }
 
+type NativeMeshIngress = {
+	current(): boolean;
+	adopt(session: AgentSession): boolean;
+	retain(): () => void;
+	done(): void;
+};
+
 export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
@@ -521,9 +528,37 @@ export class AgentDaemon {
 	private readonly unsafeMeshSessions = new WeakSet<AgentSession>();
 	private readonly meshMessageIds = new WeakMap<AgentSession, Set<string>>();
 	private readonly nativeMeshFingerprints = new WeakMap<AgentSession, Map<string, string>>();
+	// One observation per native request. Promise reactions cannot be unsubscribed,
+	// so retries share the reactions as well as replacing the current listeners.
+	private readonly nativeMeshObservers = new WeakMap<
+		AgentSession,
+		Map<
+			string,
+			{
+				cleanup?: () => void;
+				dropped?: (error: unknown) => void;
+				completed?: () => void;
+				failure?: { error: unknown };
+				stopOutcome?: () => void;
+				deliveryPending: boolean;
+				completionPending: boolean;
+				deliveryRegistered: boolean;
+				completionRegistered: boolean;
+			}
+		>
+	>();
 	private readonly meshAdmissions = new WeakMap<
 		AgentSession,
 		Map<string, Promise<{ status: AgentSessionMessageDeliveryStatus }>>
+	>();
+	private nativeMeshIngressSequence = 0;
+	private readonly nativeMeshIngress = new Map<
+		string,
+		{
+			pending: number;
+			observing: number;
+			latest: WeakMap<AgentSession, number>;
+		}
 	>();
 	private meshReplacementOffered = false;
 	private readonly closingSessions = new Map<
@@ -3793,6 +3828,34 @@ export class AgentDaemon {
 	}
 
 	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
+		// Stamp native wire order before the independent asynchronous supervisor fence.
+		// The ordinary parser still owns errors and admission registration.
+		let ingress: NativeMeshIngress | undefined;
+		try {
+			const wire = JSON.parse(line) as unknown;
+			const parsed = isDaemonCommandEnvelope(wire) ? wire.command : wire;
+			if (
+				parsed &&
+				typeof parsed === "object" &&
+				"type" in parsed &&
+				parsed.type === "worker_native_mesh_deliver_message"
+			) {
+				ingress = this.beginNativeMeshIngress(
+					client,
+					parsed as Extract<DaemonWorkerCommand, { type: "worker_native_mesh_deliver_message" }>,
+				);
+			}
+		} catch {
+			// Leave malformed input to the ordinary parser.
+		}
+		try {
+			await this.handleLineInner(client, line, ingress);
+		} finally {
+			ingress?.done();
+		}
+	}
+
+	private async handleLineInner(client: DaemonSocketClient, line: string, ingress?: NativeMeshIngress): Promise<void> {
 		let command: DaemonCommand;
 		let clearParsedAdmission = () => {};
 		let promptHandlerOwnsAdmission = false;
@@ -4042,7 +4105,7 @@ export class AgentDaemon {
 				}
 				if (!updateLifecycle) this.mutationDrain.begin();
 				try {
-					await this.handleWorkerCommand(client, workerCommand);
+					await this.handleWorkerCommand(client, workerCommand, ingress);
 				} finally {
 					if (!updateLifecycle) this.mutationDrain.end();
 				}
@@ -4110,7 +4173,11 @@ export class AgentDaemon {
 		});
 	}
 
-	private async handleWorkerCommand(client: DaemonSocketClient, command: DaemonWorkerCommand): Promise<void> {
+	private async handleWorkerCommand(
+		client: DaemonSocketClient,
+		command: DaemonWorkerCommand,
+		ingress?: NativeMeshIngress,
+	): Promise<void> {
 		try {
 			switch (command.type) {
 				case "worker_auth":
@@ -4175,7 +4242,7 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_native_mesh_deliver_message": {
-					await this.receiveMeshMessage(client, command);
+					await this.receiveMeshMessage(client, command, ingress);
 					return;
 				}
 				case "worker_deliver_message": {
@@ -6671,9 +6738,95 @@ export class AgentDaemon {
 		};
 	}
 
+	private beginNativeMeshIngress(
+		client: DaemonSocketClient,
+		command: Extract<DaemonWorkerCommand, { type: "worker_native_mesh_deliver_message" }>,
+	): NativeMeshIngress | undefined {
+		const boundClaim = this.supervisorClaims.get(client);
+		if (
+			this.agentMessageTransport !== "native" ||
+			!boundClaim ||
+			client.socket.destroyed ||
+			typeof command.requestId !== "string" ||
+			!/^nm1m-[a-f0-9]{64}$/.test(command.requestId) ||
+			typeof command.attemptToken !== "string" ||
+			!command.attemptToken ||
+			typeof command.expectedSessionId !== "string" ||
+			!command.expectedSessionId ||
+			typeof command.targetActiveSessionId !== "string" ||
+			typeof command.message !== "string"
+		)
+			return undefined;
+		// Conflicting payloads do not supersede one another. Track aliases together,
+		// but compare canonical session identity only after hydration and validation.
+		const key = JSON.stringify([
+			command.expectedSessionId,
+			command.requestId,
+			normalizeAgentSessionMessage(command.message),
+			command.sender?.activeSessionId,
+			command.sender?.sessionId,
+			command.sender?.sessionName,
+			command.sender?.runtimeKind,
+			command.sender?.clientId,
+			command.fromRelationship,
+		]);
+		const group = this.nativeMeshIngress.get(key) ?? {
+			pending: 0,
+			observing: 0,
+			latest: new WeakMap<AgentSession, number>(),
+		};
+		this.nativeMeshIngress.set(key, group);
+		const sequence = ++this.nativeMeshIngressSequence;
+		group.pending++;
+		let adopted: AgentSession | undefined;
+		const prune = () => {
+			if (!group.pending && !group.observing && this.nativeMeshIngress.get(key) === group)
+				this.nativeMeshIngress.delete(key);
+		};
+		const current = () =>
+			this.supervisorClaims.get(client) === boundClaim &&
+			!client.socket.destroyed &&
+			(!adopted || group.latest.get(adopted) === sequence);
+		return {
+			current,
+			adopt: (session) => {
+				if (!current() || (group.latest.get(session) ?? 0) > sequence) return false;
+				group.latest.set(session, sequence);
+				adopted = session;
+				return true;
+			},
+			retain: () => {
+				group.observing++;
+				return () => {
+					group.observing--;
+					prune();
+				};
+			},
+			done: () => {
+				group.pending--;
+				prune();
+			},
+		};
+	}
+
 	private async receiveMeshMessage(
 		client: DaemonSocketClient,
 		command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" | "worker_native_mesh_deliver_message" }>,
+		ingress?: NativeMeshIngress,
+	): Promise<void> {
+		if (command.type !== "worker_native_mesh_deliver_message") return this.receiveMeshMessageAttempt(client, command);
+		const ownIngress = ingress ? undefined : this.beginNativeMeshIngress(client, command);
+		try {
+			await this.receiveMeshMessageAttempt(client, command, ingress ?? ownIngress);
+		} finally {
+			ownIngress?.done();
+		}
+	}
+
+	private async receiveMeshMessageAttempt(
+		client: DaemonSocketClient,
+		command: Extract<DaemonWorkerCommand, { type: "worker_deliver_message" | "worker_native_mesh_deliver_message" }>,
+		ingress?: NativeMeshIngress,
 	): Promise<void> {
 		const native = command.type === "worker_native_mesh_deliver_message";
 		if (native) {
@@ -6699,7 +6852,9 @@ export class AgentDaemon {
 		try {
 			target = await this.getOrHydrateBoundSessionState(command.targetActiveSessionId);
 		} catch (error) {
+			if (ingress && !ingress.current()) throw new Error("Superseded native mesh attempt");
 			const passive = await this.findPassiveRlmSubagent(command.targetActiveSessionId);
+			if (ingress && !ingress.current()) throw new Error("Superseded native mesh attempt");
 			if (!passive) throw error;
 			target = await this.hydratePassiveRlmSubagent(passive);
 		}
@@ -6710,6 +6865,8 @@ export class AgentDaemon {
 			throw new Error("Mesh session must be reopened from disk after replacement failure");
 		const manager = recipientSession.sessionManager;
 		if (!manager.isPersisted() || !manager.getSessionFile()) throw new Error("Mesh target has no session file");
+
+		if (ingress && !ingress.current()) throw new Error("Superseded native mesh attempt");
 		if (manager.rewritesOnNextPersist()) {
 			try {
 				const diskEntries = await loadEntriesFromFileAsync(manager.getSessionFile()!);
@@ -6717,13 +6874,15 @@ export class AgentDaemon {
 				if (
 					latestName?.type === "session_info" &&
 					typeof latestName.name === "string" &&
-					!manager.getEntries().some((entry) => entry.id === latestName.id)
+					!manager.getEntries().some((entry) => entry.id === latestName.id) &&
+					(!ingress || ingress.current())
 				)
 					recipientSession.setSessionName(latestName.name);
 			} catch {
 				this.log(`Mesh name adoption skipped for session ${manager.getSessionId()}`);
 			}
 		}
+		if (ingress && !ingress.current()) throw new Error("Superseded native mesh attempt");
 		const payload: AgentSessionMessagePayload = {
 			id: `${AGENT_MESSAGE_ID_PREFIX}${native ? `native-mesh:${meshId}` : meshId}`,
 			source: AGENT_MESSAGE_SOURCE,
@@ -6761,6 +6920,8 @@ export class AgentDaemon {
 				from?.clientId,
 				relationship,
 			]);
+		if (native && !ingress) throw new Error("Invalid native mesh delivery or closed supervisor connection");
+		if (ingress && !ingress.current()) throw new Error("Superseded native mesh attempt");
 		let nativeFingerprints: Map<string, string> | undefined;
 		if (native) {
 			nativeFingerprints = this.nativeMeshFingerprints.get(recipientSession) ?? new Map();
@@ -6774,8 +6935,10 @@ export class AgentDaemon {
 				(details && fingerprint(details.message, details.from, details.fromRelationship) !== expected)
 			)
 				throw new Error("Native mesh request ID conflicts with existing delivery");
+			if (ingress && !ingress.adopt(recipientSession)) throw new Error("Superseded native mesh attempt");
 			nativeFingerprints.set(payload.id, expected);
 		}
+
 		const messageIds = this.meshMessageIds.get(recipientSession) ?? new Set<string>();
 		if (!this.meshMessageIds.has(recipientSession)) {
 			this.meshMessageIds.set(recipientSession, messageIds);
@@ -6785,6 +6948,20 @@ export class AgentDaemon {
 					if (entry && manager.isEntryPersisted(entry.id)) {
 						messageIds.delete(id);
 						this.nativeMeshFingerprints.get(recipientSession)?.delete(id);
+						// Stop observing after persistence even if the socket is gone and
+						// the recipient turn does not complete for a long time.
+						const observers = this.nativeMeshObservers.get(recipientSession);
+						const observer = observers?.get(id);
+						if (observer) {
+							observer.stopOutcome?.();
+							observer.stopOutcome = undefined;
+							observer.deliveryPending = false;
+							observer.completionPending = false;
+							// Keep the generation while an attempt or admission still owns it.
+							// A later retry must be able to detach the previous attempt.
+							if (!observer.cleanup && !this.meshAdmissions.get(recipientSession)?.has(id))
+								observers?.delete(id);
+						}
 					}
 				}
 			});
@@ -6797,19 +6974,84 @@ export class AgentDaemon {
 		}
 		const existing = ownEntry();
 		if (!existing || !manager.isEntryPersisted(existing.id)) messageIds.add(payload.id);
+		const admissions = this.meshAdmissions.get(recipientSession) ?? new Map();
+		this.meshAdmissions.set(recipientSession, admissions);
+		const observers = native ? (this.nativeMeshObservers.get(recipientSession) ?? new Map()) : undefined;
+		if (observers) this.nativeMeshObservers.set(recipientSession, observers);
+		let observer = observers?.get(payload.id);
+		observer?.cleanup?.();
+		if (observers && !observer) {
+			observer = {
+				deliveryPending: false,
+				completionPending: false,
+				deliveryRegistered: false,
+				completionRegistered: false,
+			};
+		}
+		if (observer) observers?.set(payload.id, observer);
+		const currentObserver = observer;
+		const releaseIngress = ingress?.retain();
+		const pruneObserver = () => {
+			if (
+				currentObserver &&
+				!currentObserver.cleanup &&
+				!currentObserver.deliveryPending &&
+				!currentObserver.completionPending &&
+				!currentObserver.failure &&
+				!admissions.has(payload.id) &&
+				observers?.get(payload.id) === currentObserver
+			) {
+				observers?.delete(payload.id);
+			}
+		};
+		// A terminal outcome belongs to the session/request generation, not to a
+		// socket attempt. Never let a late reaction remove a newer generation.
+		const finishFailedGeneration = () => {
+			if (!currentObserver?.failure || admissions.has(payload.id) || observers?.get(payload.id) !== currentObserver)
+				return;
+			messageIds.delete(payload.id);
+			this.nativeMeshFingerprints.get(recipientSession)?.delete(payload.id);
+			observers?.delete(payload.id);
+		};
+		const failGeneration = (error: unknown) => {
+			if (!currentObserver || observers?.get(payload.id) !== currentObserver || currentObserver.failure) return;
+			currentObserver.failure = { error };
+			currentObserver.stopOutcome?.();
+			currentObserver.stopOutcome = undefined;
+			currentObserver.deliveryPending = false;
+			currentObserver.completionPending = false;
+			try {
+				currentObserver.dropped?.(error);
+			} catch (writeError) {
+				this.log(`Native mesh terminal notification failed: ${String(writeError)}`);
+			} finally {
+				finishFailedGeneration();
+			}
+		};
 		let accepted = false;
 		let sent = false;
 		let active = true;
-		let deliveryFailure: unknown;
+		let deliveryFailure: unknown = currentObserver?.failure?.error;
 		let unsubscribe: (() => void) | undefined;
 		let unregisterDispose: (() => void) | undefined;
 		const cleanup = () => {
+			if (!active) return;
 			active = false;
+			releaseIngress?.();
 			unsubscribe?.();
 			unregisterDispose?.();
 			client.socket.off("close", cleanup);
+			if (currentObserver?.cleanup === cleanup) {
+				currentObserver.cleanup = undefined;
+				currentObserver.dropped = undefined;
+				pruneObserver();
+			}
 		};
 		const check = () => {
+			if (ingress && !ingress.current()) {
+				cleanup();
+				return;
+			}
 			if (!accepted || sent || !active || this.unsafeMeshSessions.has(recipientSession)) return;
 			if (
 				native &&
@@ -6833,6 +7075,11 @@ export class AgentDaemon {
 					return;
 				}
 				this.nativeMeshFingerprints.get(recipientSession)?.delete(payload.id);
+				if (currentObserver && observers?.get(payload.id) === currentObserver) {
+					currentObserver.stopOutcome?.();
+					currentObserver.stopOutcome = undefined;
+					observers?.delete(payload.id);
+				}
 			}
 			sent = true;
 			cleanup();
@@ -6850,8 +7097,14 @@ export class AgentDaemon {
 			);
 		};
 		const dropped = (error: unknown) => {
-			messageIds.delete(payload.id);
-			this.nativeMeshFingerprints.get(recipientSession)?.delete(payload.id);
+			if (native && (!active || (ingress && !ingress.current()))) {
+				cleanup();
+				return;
+			}
+			if (!native) {
+				messageIds.delete(payload.id);
+				this.nativeMeshFingerprints.get(recipientSession)?.delete(payload.id);
+			}
 			deliveryFailure = error;
 			check();
 			const reason = this.unsafeMeshSessions.has(recipientSession)
@@ -6881,47 +7134,106 @@ export class AgentDaemon {
 				),
 			);
 		};
+		if (currentObserver) {
+			currentObserver.cleanup = cleanup;
+			currentObserver.dropped = dropped;
+			currentObserver.completed = () => {
+				if (!ownEntry()) failGeneration(new Error("Agent message turn ended without its own entry"));
+			};
+		}
 		unsubscribe = manager.onPersist(check);
 		unregisterDispose = target.runtime.session.registerDisposeCallback(() =>
-			Promise.resolve().then(() => dropped(new Error("Mesh recipient disposed before persistence"))),
+			Promise.resolve().then(() => {
+				const error = new Error("Mesh recipient disposed before persistence");
+				if (currentObserver) failGeneration(error);
+				else dropped(error);
+			}),
 		);
 		client.socket.once("close", cleanup);
 		const queued = recipientSession.hasQueuedAgentMessage(payload.id);
 		if (!ownEntry()) {
-			// Native delivery waiters must be registered before admission.
-			void target.runtime.session.waitForAgentMessagePromptDelivery(payload.id).catch(dropped);
-			void target.runtime.session.waitForAgentMessagePromptCompletion(payload.id).then(() => {
-				if (!ownEntry()) dropped(new Error("Agent message turn ended without its own entry"));
-			}, dropped);
+			// Delivery waiters must be registered before admission. Native retries share
+			// reactions on AgentSession's per-ID deferred promises.
+			if (!currentObserver) {
+				void target.runtime.session.waitForAgentMessagePromptDelivery(payload.id).catch(dropped);
+				void target.runtime.session.waitForAgentMessagePromptCompletion(payload.id).then(() => {
+					if (!ownEntry()) dropped(new Error("Agent message turn ended without its own entry"));
+				}, dropped);
+			} else {
+				if (!currentObserver.deliveryRegistered && !currentObserver.completionRegistered) {
+					currentObserver.deliveryRegistered = true;
+					currentObserver.completionRegistered = true;
+					currentObserver.deliveryPending = true;
+					currentObserver.completionPending = true;
+					currentObserver.stopOutcome = recipientSession.observeAgentMessagePromptOutcome(
+						payload.id,
+						(leg, error) => {
+							if (observers?.get(payload.id) !== currentObserver) return;
+							if (leg === "delivery") currentObserver.deliveryPending = false;
+							else currentObserver.completionPending = false;
+							if (error) failGeneration(error);
+							else if (leg === "completion") {
+								currentObserver.stopOutcome?.();
+								currentObserver.stopOutcome = undefined;
+								currentObserver.deliveryPending = false;
+								currentObserver.completed?.();
+							}
+							pruneObserver();
+						},
+					);
+				}
+			}
 		}
+		let admissionFailed = false;
+		let admissionSucceeded = false;
 		try {
 			if (this.unsafeMeshSessions.has(recipientSession)) throw new Error("Mesh session is held for replacement");
 			let status: AgentSessionMessageDeliveryStatus;
-			const admissions = this.meshAdmissions.get(recipientSession) ?? new Map();
-			this.meshAdmissions.set(recipientSession, admissions);
 			let admission = admissions.get(payload.id);
-			if (admission) status = (await admission).status;
-			else if (ownEntry()) status = "delivered";
+			if (admission) {
+				try {
+					status = (await admission).status;
+				} catch (error) {
+					admissionFailed = true;
+					throw error;
+				}
+			} else if (ownEntry()) status = "delivered";
 			else if (queued) status = "queued";
 			else {
 				admission = this.acceptAgentSessionMessage(target, payload);
 				admissions.set(payload.id, admission);
 				try {
 					status = (await admission).status;
+				} catch (error) {
+					admissionFailed = true;
+					throw error;
 				} finally {
-					admissions.delete(payload.id);
+					if (admissions.get(payload.id) === admission) admissions.delete(payload.id);
+					finishFailedGeneration();
+					pruneObserver();
 				}
 			}
+			admissionSucceeded = true;
+			if (ingress && !ingress.current()) throw new Error("Superseded native mesh attempt");
 			this.writeWorkerSuccess(client, command, createAgentSessionMessageReceipt(payload, status));
 			accepted = true;
 			check();
 			if (deliveryFailure !== undefined) dropped(deliveryFailure);
 		} catch (error) {
-			target.runtime.session.rejectAgentMessagePrompt(
-				payload.id,
-				error instanceof Error ? error : new Error(String(error)),
-			);
-			dropped(error);
+			if (
+				(!currentObserver || !admissionSucceeded) &&
+				(!ingress || ingress.current() || admissionFailed) &&
+				(!currentObserver || observers?.get(payload.id) === currentObserver)
+			)
+				target.runtime.session.rejectAgentMessagePrompt(
+					payload.id,
+					error instanceof Error ? error : new Error(String(error)),
+				);
+			if (currentObserver) {
+				// Supersession is local to this attempt, not a terminal outcome for
+				// the shared request. An admission failure, however, is shared.
+				if (admissionFailed || (!admissionSucceeded && (!ingress || ingress.current()))) failGeneration(error);
+			} else dropped(error);
 			cleanup();
 			throw error;
 		}
