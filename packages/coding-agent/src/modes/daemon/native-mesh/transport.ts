@@ -337,6 +337,8 @@ export class NativeMeshTransport {
 		const started = Date.now();
 		const deadline = started + this.discoveryTimeoutMs;
 		let pages = 0;
+		let pageLimit = 1000;
+		let firstRequest = true;
 		let bytes = 0,
 			records = 0;
 		const budget = {
@@ -352,14 +354,33 @@ export class NativeMeshTransport {
 			let revision: string | undefined;
 			try {
 				for (;;) {
-					const query = new URLSearchParams({ limit: "100" });
+					const query = new URLSearchParams({ limit: String(pageLimit) });
 					if (after !== undefined) {
 						query.set("after", after);
 						query.set("revision", revision!);
 					}
-					const result = record(
-						await this.request("discover", `/v1/native-mesh/agents?${query}`, "GET", undefined, budget),
-					);
+					const isFirstRequest = firstRequest;
+					firstRequest = false;
+					let raw: unknown;
+					try {
+						raw = await this.request("discover", `/v1/native-mesh/agents?${query}`, "GET", undefined, budget);
+					} catch (error) {
+						// Legacy servers reject the larger page size. Retry only the first request,
+						// before consuming any page, and retain all original scan limits.
+						if (isFirstRequest && error instanceof NativeMeshRequestError && error.status === 400) {
+							pageLimit = 100;
+							recordNativeMeshDiagnostic({
+								component: "supervisor",
+								operation: "discover",
+								stage: "discover",
+								status: "skipped",
+								httpStatus: 400,
+							});
+							continue;
+						}
+						throw error;
+					}
+					const result = record(raw);
 					if (!Array.isArray(result?.agents)) throw validationFailure("discover");
 					const agents = result.agents.map(observation);
 					if (agents.some((a) => !a)) throw validationFailure("discover");
@@ -395,7 +416,7 @@ export class NativeMeshTransport {
 						typeof result.revision !== "string" ||
 						!/^(0|[1-9][0-9]{0,18})$/.test(result.revision) ||
 						(revision !== undefined && revision !== result.revision) ||
-						agents.length > 100
+						agents.length > pageLimit
 					)
 						throw validationFailure("discover");
 					revision = result.revision;

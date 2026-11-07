@@ -1,5 +1,8 @@
+import { readFile, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import { dirname } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { configureNativeMeshDiagnostic } from "../src/modes/daemon/native-mesh/diagnostic.js";
 import {
 	NativeMeshRequestError,
 	NativeMeshTransport,
@@ -151,12 +154,29 @@ describe("native mesh paginated discovery", () => {
 	let server: Server, client: NativeMeshTransport;
 	let mode = "ok",
 		calls = 0;
+	const requests: URLSearchParams[] = [];
+	const revisionValue = "847392658174";
+	const tokenValue = "sensitive-token-never-log-829357";
 	beforeAll(async () => {
 		server = createServer((req, res) => {
 			const query = new URL(req.url!, "http://localhost").searchParams;
 			calls++;
+			requests.push(new URLSearchParams(query));
 			const cursor = query.get("after");
-			if ((mode === "changed" && cursor && calls === 2) || (mode === "always-changed" && cursor)) {
+			const limit = Number(query.get("limit"));
+			if (
+				((mode === "old" || mode === "old-too-many" || mode === "old-later-400" || mode === "old-changed") &&
+					limit > 100) ||
+				mode === "both-400" ||
+				((mode === "later-400" || mode === "old-later-400") && cursor)
+			) {
+				res.writeHead(400).end("private server metadata");
+				return;
+			}
+			if (
+				(((mode === "changed" && calls === 2) || (mode === "old-changed" && calls === 3)) && cursor) ||
+				(mode === "always-changed" && cursor)
+			) {
 				res.writeHead(409).end();
 				return;
 			}
@@ -166,15 +186,15 @@ describe("native mesh paginated discovery", () => {
 				return;
 			}
 			const start = cursor ? agents.findIndex((a) => a.id === cursor) + 1 : 0;
-			let page = agents.slice(start, start + 100);
-			let revision = "1";
+			let page = agents.slice(start, start + limit);
+			let revision = revisionValue;
 			let nextCursor: string | null = start + page.length < agents.length ? page.at(-1)!.id : null;
 			if (mode === "duplicate") page = [page[0]!, page[0]!];
 			if (mode === "unordered") page = page.slice().reverse();
 			if (mode === "bad-record") page = [{ ...page[0]!, status: "online" } as (typeof page)[number]];
 			if (mode === "bad-cursor") nextCursor = agents[500]!.id;
 			if (mode === "bad-revision" && cursor) revision = "2";
-			if (mode === "too-many") page = agents.slice(0, 101);
+			if (mode === "too-many" || mode === "old-too-many") page = agents.slice(0, limit + 1);
 			if (mode === "cross-duplicate" && cursor) page = [agents[start - 1]!, ...page.slice(1)];
 			const padding =
 				mode === "byte-budget" ? " ".repeat(1_950_000) : mode === "page-budget" ? " ".repeat(2 * 1024 * 1024) : "";
@@ -185,13 +205,14 @@ describe("native mesh paginated discovery", () => {
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		client = new NativeMeshTransport({
 			url: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
-			token: "test",
+			token: tokenValue,
 			timeoutMs: 30_000,
 		});
 	});
 	beforeEach(() => {
 		mode = "ok";
 		calls = 0;
+		requests.length = 0;
 	});
 	afterAll(async () => {
 		await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
@@ -201,13 +222,101 @@ describe("native mesh paginated discovery", () => {
 		calls = 0;
 		expect(Buffer.byteLength(JSON.stringify({ agents }))).toBeGreaterThan(2 * 1024 * 1024);
 		expect(await client.discover()).toEqual(agents);
-		expect(calls).toBe(70);
+		expect(calls).toBe(7);
+		expect(requests.map((query) => query.get("limit"))).toEqual(Array(7).fill("1000"));
+		expect([...requests[0]!.keys()]).toEqual(["limit"]);
+		for (let i = 1; i < requests.length; i++) {
+			expect(Object.fromEntries(requests[i]!)).toEqual({
+				limit: "1000",
+				after: agents[i * 1000 - 1]!.id,
+				revision: revisionValue,
+			});
+		}
+	});
+	it("falls back once from a first-page 400 and reads the complete old-server scan", async () => {
+		mode = "old";
+		expect(await client.discover()).toEqual(agents);
+		expect(calls).toBe(71);
+		expect(Object.fromEntries(requests[0]!)).toEqual({ limit: "1000" });
+		expect(Object.fromEntries(requests[1]!)).toEqual({ limit: "100" });
+		for (let i = 2; i < requests.length; i++) {
+			expect(Object.fromEntries(requests[i]!)).toEqual({
+				limit: "100",
+				after: agents[(i - 1) * 100 - 1]!.id,
+				revision: revisionValue,
+			});
+		}
+	});
+	it("does not fall back after a later page returns 400", async () => {
+		mode = "later-400";
+		await expect(client.discover()).rejects.toMatchObject({
+			operation: "discover",
+			outcome: "rejected",
+			status: 400,
+		});
+		expect(calls).toBe(2);
+		expect(requests.map((query) => query.get("limit"))).toEqual(["1000", "1000"]);
+	});
+	it("does not fall back repeatedly if the old limit also returns 400", async () => {
+		mode = "both-400";
+		await expect(client.discover()).rejects.toMatchObject({
+			operation: "discover",
+			outcome: "rejected",
+			status: 400,
+		});
+		expect(requests.map((query) => query.get("limit"))).toEqual(["1000", "100"]);
+	});
+	it("enforces the old page limit after fallback", async () => {
+		mode = "old-too-many";
+		await expect(client.discover()).rejects.toBeInstanceOf(NativeMeshRequestError);
+		expect(requests.map((query) => query.get("limit"))).toEqual(["1000", "100"]);
+	});
+	it("does not retry a later-page 400 after falling back", async () => {
+		mode = "old-later-400";
+		await expect(client.discover()).rejects.toMatchObject({ status: 400 });
+		expect(requests.map((query) => query.get("limit"))).toEqual(["1000", "100", "100"]);
+	});
+	it("retains the old limit when a 409 restarts a fallback scan", async () => {
+		mode = "old-changed";
+		expect(await client.discover()).toEqual(agents);
+		expect(calls).toBe(73);
+		expect(requests[3]!.get("after")).toBeNull();
+		expect(requests[3]!.get("revision")).toBeNull();
+		expect(requests.slice(1).every((query) => query.get("limit") === "100")).toBe(true);
+	});
+	it("does not expose request values or response metadata in diagnostics", async () => {
+		const diagnostic = configureNativeMeshDiagnostic({ enabled: true, ttlMs: 30_000 });
+		const path = await diagnostic.ready;
+		expect(path).toBeDefined();
+		try {
+			mode = "later-400";
+			await expect(client.discover()).rejects.toMatchObject({ status: 400 });
+			await diagnostic.close();
+			const output = await readFile(path!, "utf8");
+			expect(output).toContain('"operation":"discover"');
+			for (const value of [
+				agents[999]!.id,
+				revisionValue,
+				"private server metadata",
+				tokenValue,
+				"after=",
+				"revision=",
+			]) {
+				expect(output).not.toContain(value);
+			}
+		} finally {
+			await diagnostic.close();
+			configureNativeMeshDiagnostic();
+			if (path) await rm(dirname(path), { recursive: true, force: true });
+		}
 	});
 	it("restarts a changed scan rather than returning an inconsistent directory", async () => {
 		mode = "changed";
 		calls = 0;
 		expect(await client.discover()).toEqual(agents);
-		expect(calls).toBe(72);
+		expect(calls).toBe(9);
+		expect(requests[2]!.get("after")).toBeNull();
+		expect(requests[2]!.get("revision")).toBeNull();
 	});
 	it("bounds retries, total bytes and the overall discovery deadline", async () => {
 		mode = "always-changed";
