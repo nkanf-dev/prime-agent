@@ -6831,7 +6831,14 @@ export class AgentDaemon {
 	): Promise<void> {
 		const native = command.type === "worker_native_mesh_deliver_message";
 		const trace = (
-			stage: "handoff" | "admission" | "session-sync" | "persisted-frame" | "delivery" | "model-processing" | "reply-generation",
+			stage:
+				| "handoff"
+				| "admission"
+				| "session-sync"
+				| "persisted-frame"
+				| "delivery"
+				| "model-processing"
+				| "reply-generation",
 			status: "start" | "success" | "failure" | "drop" | "unknown",
 		) => {
 			if (!native) return;
@@ -6863,6 +6870,18 @@ export class AgentDaemon {
 			throw new Error("Mesh delivery requires the authenticated Cotal transport mode");
 		const meshId = native ? command.requestId : command.cotal!.id;
 		const attemptToken = native ? command.attemptToken : command.cotal!.attemptToken;
+		// A delivery may hydrate a passive child, but only an already-bound live
+		// session is eligible for the native abort-suspension wake.
+		let nativeLiveTarget: ActiveSessionState | undefined;
+		if (native) {
+			try {
+				nativeLiveTarget = this.getBoundSessionState(command.targetActiveSessionId);
+			} catch {
+				// Preserve the normal hydration and delivery path without waking it.
+			}
+		}
+		const nativeWakeSession = nativeLiveTarget?.runtime.session;
+		const nativeWakeEpoch = nativeWakeSession?.nativeMessageInputEpoch;
 		let target: ActiveSessionState;
 		try {
 			target = await this.getOrHydrateBoundSessionState(command.targetActiveSessionId);
@@ -6874,6 +6893,7 @@ export class AgentDaemon {
 			target = await this.hydratePassiveRlmSubagent(passive);
 		}
 		const recipientSession = target.runtime.session;
+		const wakeEpoch = nativeWakeSession === recipientSession ? nativeWakeEpoch : undefined;
 		if (native && recipientSession.sessionId !== command.expectedSessionId) {
 			trace("handoff", "failure");
 			throw new Error("Native mesh target session changed");
@@ -7214,6 +7234,21 @@ export class AgentDaemon {
 				}
 			}
 		}
+		const validateNativeWake = () => {
+			if (
+				!native ||
+				nativeLiveTarget !== target ||
+				this.sessions.get(target.activeSessionId) !== target ||
+				target.runtime.session !== recipientSession ||
+				recipientSession.sessionId !== command.expectedSessionId ||
+				this.bindingSessions.has(target.activeSessionId) ||
+				this.closingSessions.has(target.activeSessionId) ||
+				this.unsafeMeshSessions.has(recipientSession) ||
+				this.agentMessagesPaused ||
+				!ingress?.current()
+			)
+				throw new Error("Native mesh wake is no longer eligible");
+		};
 		let admissionFailed = false;
 		let admissionSucceeded = false;
 		trace("admission", "start");
@@ -7221,6 +7256,7 @@ export class AgentDaemon {
 			if (this.unsafeMeshSessions.has(recipientSession)) throw new Error("Mesh session is held for replacement");
 			let status: AgentSessionMessageDeliveryStatus;
 			let admission = admissions.get(payload.id);
+			const existingAdmission = Boolean(admission) || queued;
 			if (admission) {
 				try {
 					status = (await admission).status;
@@ -7231,7 +7267,13 @@ export class AgentDaemon {
 			} else if (ownEntry()) status = "delivered";
 			else if (queued) status = "queued";
 			else {
-				admission = this.acceptAgentSessionMessage(target, payload);
+				admission = this.acceptAgentSessionMessage(
+					target,
+					payload,
+					native && nativeLiveTarget === target && wakeEpoch !== undefined
+						? { epoch: wakeEpoch, validate: validateNativeWake }
+						: undefined,
+				);
 				admissions.set(payload.id, admission);
 				try {
 					status = (await admission).status;
@@ -7245,6 +7287,15 @@ export class AgentDaemon {
 				}
 			}
 			admissionSucceeded = true;
+			if (native && wakeEpoch !== undefined && existingAdmission && status === "queued" && !ownEntry()) {
+				// A retry may own an already queued message. Failure to wake must not
+				// change the existing receipt or persistence/ACK rules.
+				try {
+					await recipientSession.wakeQueuedNativeMessage(payload.id, wakeEpoch, validateNativeWake);
+				} catch {
+					// A stale attempt or disposed session cannot wake the queue.
+				}
+			}
 			if (ingress && !ingress.current()) throw new Error("Superseded native mesh attempt");
 			trace("admission", "success");
 			// Session-level stream events can include other inputs, and the per-message
@@ -7363,9 +7414,16 @@ export class AgentDaemon {
 	private async acceptAgentSessionMessage(
 		targetState: ActiveSessionState,
 		payload: AgentSessionMessagePayload,
+		nativeWake?: { epoch: number; validate(): void },
 	): Promise<{ status: AgentSessionMessageDeliveryStatus }> {
 		const message = createAgentSessionMessage(payload);
 		const recipientSession = targetState.runtime.session;
+		if (
+			nativeWake &&
+			(await recipientSession.acceptSuspendedNativeMessage(message, nativeWake.epoch, nativeWake.validate))
+		) {
+			return { status: "queued" };
+		}
 		let preflightFailed = false;
 		let preflightQueued = false;
 		await recipientSession.acceptAgentMessagePrompt(message.content, {

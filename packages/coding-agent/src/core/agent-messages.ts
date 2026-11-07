@@ -369,14 +369,21 @@ export function assertDirectAgentMessageTarget(target: string): string {
 	return normalized;
 }
 
+export class AgentMessageQueueCapacityError extends Error {
+	constructor(unfinishedActionCount: number, maxPending: number) {
+		super(
+			`Target session has too many pending messages: ${unfinishedActionCount} unfinished, limit is ${maxPending}`,
+		);
+		this.name = "AgentMessageQueueCapacityError";
+	}
+}
+
 export function assertAgentMessageQueueCapacity(
 	unfinishedActionCount: number,
 	maxPending = DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 ): void {
 	if (unfinishedActionCount >= maxPending) {
-		throw new Error(
-			`Target session has too many pending messages: ${unfinishedActionCount} unfinished, limit is ${maxPending}`,
-		);
+		throw new AgentMessageQueueCapacityError(unfinishedActionCount, maxPending);
 	}
 }
 

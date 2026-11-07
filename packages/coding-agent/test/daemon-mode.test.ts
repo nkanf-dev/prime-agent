@@ -71,13 +71,13 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
-import { nativeMeshDiagnostic } from "../src/modes/daemon/native-mesh/diagnostic.js";
 import {
 	DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 	type DaemonWorkerCommand,
 	type DaemonWorkerFrameHeader,
 	isDaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
+import { nativeMeshDiagnostic } from "../src/modes/daemon/native-mesh/diagnostic.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 import {
 	createSnapshotTranscriptChunks,
@@ -4477,6 +4477,649 @@ describe("mesh worker persistence", () => {
 		return { root, internals, client, socket, written, frames, authenticate };
 	}
 
+	it.each(["idle", "post-abort"] as const)(
+		"native message is processed and durably acknowledged for a live %s session",
+		async (mode) => {
+			const h = harness();
+			await h.authenticate("native");
+			const entered = createDeferred();
+			const release = createDeferred();
+			const live = await createHarness({
+				persistSession: true,
+				tools: [
+					{
+						name: "wake_hold",
+						label: "hold",
+						description: "test gate",
+						parameters: Type.Object({}),
+						execute: async () => {
+							entered.resolve();
+							await release.promise;
+							return { content: [], details: {} };
+						},
+					},
+				],
+			});
+			const state = makeState("target");
+			state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			const command = {
+				type: "worker_native_mesh_deliver_message",
+				targetActiveSessionId: "target",
+				expectedSessionId: live.session.sessionId,
+				message: "wake test",
+				sender: { sessionId: "sender" },
+				requestId: `nm1m-${"d".repeat(64)}`,
+				attemptToken: "first",
+			} as const;
+			const id = `agentmsg_native-mesh:${command.requestId}`;
+			const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt");
+			let control: Promise<void> | undefined;
+			try {
+				if (mode === "post-abort") {
+					live.setResponses([fauxAssistantMessage(fauxToolCall("wake_hold", {}), { stopReason: "toolUse" })]);
+					control = live.session.prompt("hold");
+					void control.catch(() => undefined);
+					await entered.promise;
+					await live.session.followUp("older queued work");
+					live.session.requestAbort();
+					release.resolve();
+					await Promise.allSettled([control]);
+					await live.session.waitForSessionInputIdle();
+					expect(live.session.isQueuedWorkSuspended).toBe(true);
+					expect(live.session.getSessionActionSnapshot().followUps).toContain("older queued work");
+				}
+				live.setResponses([fauxAssistantMessage("done one"), fauxAssistantMessage("done two")]);
+				await h.internals.receiveMeshMessage(h.client, command);
+				await vi.waitFor(() => {
+					expect(h.frames().some((f) => f.type === "native_mesh_message_persisted")).toBe(true);
+				});
+				await live.session.waitForSessionInputIdle();
+				const entries = () =>
+					live.sessionManager
+						.getEntries()
+						.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id);
+				expect(entries()).toHaveLength(1);
+				expect(live.sessionManager.isEntryPersisted(entries()[0]!.id)).toBe(true);
+				expect(readFileSync(live.session.sessionFile!, "utf8").split(`"id":"${id}"`).length - 1).toBe(1);
+				if (mode === "post-abort") {
+					expect(live.session.isQueuedWorkSuspended).toBe(false);
+					expect(
+						live.session.messages.some(
+							(m) => m.role === "user" && JSON.stringify(m.content).includes("older queued work"),
+						),
+					).toBe(true);
+				}
+				live.session.requestAbort();
+				await live.session.waitForSessionInputIdle();
+				const previousAccepts = accept.mock.calls.length;
+				await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "retry" });
+				expect(live.session.isQueuedWorkSuspended).toBe(true);
+				expect(entries()).toHaveLength(1);
+				expect(accept).toHaveBeenCalledTimes(previousAccepts);
+				expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+					{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "first" },
+					{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "retry" },
+				]);
+			} finally {
+				release.resolve();
+				if (control) await Promise.allSettled([control]);
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["input pause", "queued-work pause", "update restart"] as const)(
+		"native wake does not bypass %s after ordinary suspension",
+		async (barrier) => {
+			const h = harness();
+			await h.authenticate("native");
+			const live = await createHarness({ persistSession: true });
+			const state = makeState("target");
+			state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			const command = {
+				type: "worker_native_mesh_deliver_message",
+				targetActiveSessionId: "target",
+				expectedSessionId: live.session.sessionId,
+				message: "must not wake",
+				sender: { sessionId: "sender" },
+				requestId: `nm1m-${"e".repeat(64)}`,
+				attemptToken: "first",
+			} as const;
+			live.session.requestAbort();
+			const pause =
+				barrier === "input pause"
+					? live.session.acquireSessionInputPause()
+					: barrier === "queued-work pause"
+						? live.session.acquireQueuedWorkPause()
+						: undefined;
+			if (barrier === "update restart") live.session.abortForUpdateRestart();
+			try {
+				await expect(h.internals.receiveMeshMessage(h.client, command)).rejects.toThrow();
+				await live.session.waitForSessionInputIdle();
+				expect(live.session.isQueuedWorkSuspended).toBe(true);
+				expect(live.session.messages.some((m) => JSON.stringify(m).includes("must not wake"))).toBe(false);
+				expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			} finally {
+				pause?.release();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("does not wake a live suspended session for an old session identity", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const live = await createHarness({ persistSession: true });
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.session.requestAbort();
+		try {
+			await expect(
+				h.internals.receiveMeshMessage(h.client, {
+					type: "worker_native_mesh_deliver_message",
+					targetActiveSessionId: "target",
+					expectedSessionId: "old-session",
+					message: "stale",
+					sender: { sessionId: "sender" },
+					requestId: `nm1m-${"f".repeat(64)}`,
+					attemptToken: "first",
+				}),
+			).rejects.toThrow("Native mesh target session changed");
+			expect(live.session.isQueuedWorkSuspended).toBe(true);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+		} finally {
+			live.cleanup();
+		}
+	});
+
+	it.each(["replaced target", "new abort epoch", "pause during admission"] as const)(
+		"native wake is fenced by %s while admission waits",
+		async (race) => {
+			const h = harness();
+			await h.authenticate("native");
+			const live = await createHarness({ persistSession: true });
+			const state = makeState("target");
+			state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			live.session.requestAbort();
+			const entered = createDeferred();
+			const release = createDeferred();
+			const original = live.session.acceptSuspendedNativeMessage.bind(live.session);
+			vi.spyOn(live.session, "acceptSuspendedNativeMessage").mockImplementation(async (...args) => {
+				entered.resolve();
+				await release.promise;
+				return original(...args);
+			});
+			const delivery = h.internals.receiveMeshMessage(h.client, {
+				type: "worker_native_mesh_deliver_message",
+				targetActiveSessionId: "target",
+				expectedSessionId: live.session.sessionId,
+				message: "racing",
+				sender: { sessionId: "sender" },
+				requestId: `nm1m-${"3".repeat(64)}`,
+				attemptToken: "first",
+			});
+			void delivery.catch(() => undefined);
+			let pause: { release(): void } | undefined;
+			try {
+				await entered.promise;
+				if (race === "replaced target") h.internals.sessions.delete("target");
+				if (race === "new abort epoch") live.session.requestAbort();
+				if (race === "pause during admission") pause = live.session.acquireQueuedWorkPause();
+				release.resolve();
+				await expect(delivery).rejects.toThrow();
+				await live.session.waitForSessionInputIdle();
+				expect(live.session.isQueuedWorkSuspended).toBe(true);
+				expect(live.session.messages.some((m) => JSON.stringify(m).includes("racing"))).toBe(false);
+				expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([delivery]);
+				pause?.release();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("does not wake a suspended session that was only hydrated for this delivery", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const live = await createHarness({ persistSession: true });
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		live.session.requestAbort();
+		h.internals.getOrHydrateBoundSessionState = async () => state;
+		try {
+			await expect(
+				h.internals.receiveMeshMessage(h.client, {
+					type: "worker_native_mesh_deliver_message",
+					targetActiveSessionId: "target",
+					expectedSessionId: live.session.sessionId,
+					message: "passive",
+					sender: { sessionId: "sender" },
+					requestId: `nm1m-${"4".repeat(64)}`,
+					attemptToken: "first",
+				}),
+			).rejects.toThrow();
+			await live.session.waitForSessionInputIdle();
+			expect(live.session.isQueuedWorkSuspended).toBe(true);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+		} finally {
+			live.cleanup();
+		}
+	});
+
+	it("native retry wakes an already queued delivery after an ordinary abort without a second admission", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			tools: [
+				{
+					name: "wake_hold_retry",
+					label: "hold",
+					description: "test gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.setResponses([fauxAssistantMessage(fauxToolCall("wake_hold_retry", {}), { stopReason: "toolUse" })]);
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "queued retry",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"b".repeat(64)}`,
+			attemptToken: "first",
+		} as const;
+		const id = `agentmsg_native-mesh:${command.requestId}`;
+		const accept = vi.spyOn(live.session, "acceptAgentMessagePrompt");
+		const control = live.session.prompt("hold");
+		void control.catch(() => undefined);
+		try {
+			await entered.promise;
+			await h.internals.receiveMeshMessage(h.client, command);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			live.session.requestAbort();
+			release.resolve();
+			await Promise.allSettled([control]);
+			await live.session.waitForSessionInputIdle();
+			expect(live.session.isQueuedWorkSuspended).toBe(true);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			live.setResponses([fauxAssistantMessage("done")]);
+			await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "retry" });
+			await vi.waitFor(() => {
+				expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+					{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "retry" },
+				]);
+			});
+			await live.session.waitForSessionInputIdle();
+			expect(accept).toHaveBeenCalledTimes(1);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(1);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([control]);
+			live.cleanup();
+		}
+	});
+
+	it.each([
+		["new", "no model"],
+		["new", "missing auth"],
+		["queued retry", "no model"],
+		["queued retry", "missing auth"],
+	] as const)("native %s with %s cannot wake or ACK", async (mode, failure) => {
+		const h = harness();
+		await h.authenticate("native");
+		const entered = createDeferred();
+		const release = createDeferred();
+		const live = await createHarness({
+			persistSession: true,
+			withConfiguredAuth: false,
+			tools: [
+				{
+					name: "preflight_hold",
+					label: "hold",
+					description: "test gate",
+					parameters: Type.Object({}),
+					execute: async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: [], details: {} };
+					},
+				},
+			],
+		});
+		live.authStorage.setRuntimeApiKey(live.getModel().provider, "test-key");
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "preflight failure",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"c".repeat(64)}`,
+			attemptToken: "first",
+		} as const;
+		const id = `agentmsg_native-mesh:${command.requestId}`;
+		let control: Promise<void> | undefined;
+		try {
+			live.setResponses([fauxAssistantMessage(fauxToolCall("preflight_hold", {}), { stopReason: "toolUse" })]);
+			control = live.session.prompt("hold");
+			void control.catch(() => undefined);
+			await entered.promise;
+			await live.session.followUp("older queued work");
+			if (mode === "queued retry") {
+				await h.internals.receiveMeshMessage(h.client, command);
+				expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			}
+			live.session.requestAbort();
+			release.resolve();
+			await Promise.allSettled([control]);
+			await live.session.waitForSessionInputIdle();
+			expect(live.session.getSessionActionSnapshot().followUps).toContain("older queued work");
+			if (failure === "no model") Object.assign(live.session.agent.state, { model: undefined });
+			else live.authStorage.removeRuntimeApiKey(live.getModel().provider);
+			const delivery = h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "retry" });
+			await Promise.allSettled([delivery]);
+			await live.session.waitForSessionInputIdle();
+			expect(live.session.isQueuedWorkSuspended).toBe(true);
+			expect(live.session.getSessionActionSnapshot().followUps).toContain("older queued work");
+			expect(
+				live.session.messages.some(
+					(m) => m.role === "user" && JSON.stringify(m.content).includes("older queued work"),
+				),
+			).toBe(false);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(0);
+			if (mode === "queued retry") expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+		} finally {
+			release.resolve();
+			if (control) await Promise.allSettled([control]);
+			live.cleanup();
+		}
+	});
+
+	it.each(["new abort", "input pause", "queued-work pause"] as const)(
+		"native wake rechecks %s after asynchronous preflight",
+		async (race) => {
+			const h = harness();
+			await h.authenticate("native");
+			const live = await createHarness({ persistSession: true });
+			const state = makeState("target");
+			state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			live.session.requestAbort();
+			const entered = createDeferred();
+			const release = createDeferred();
+			const internal = live.session as unknown as { _validateCanStartAgentRun(): Promise<void> };
+			const original = internal._validateCanStartAgentRun.bind(live.session);
+			vi.spyOn(internal, "_validateCanStartAgentRun").mockImplementation(async () => {
+				entered.resolve();
+				await release.promise;
+				await original();
+			});
+			const delivery = h.internals.receiveMeshMessage(h.client, {
+				type: "worker_native_mesh_deliver_message",
+				targetActiveSessionId: "target",
+				expectedSessionId: live.session.sessionId,
+				message: "preflight race",
+				sender: { sessionId: "sender" },
+				requestId: `nm1m-${"e1".repeat(32)}`,
+				attemptToken: "first",
+			});
+			void delivery.catch(() => undefined);
+			let pause: { release(): void } | undefined;
+			try {
+				await entered.promise;
+				if (race === "new abort") live.session.requestAbort();
+				if (race === "input pause") pause = live.session.acquireSessionInputPause();
+				if (race === "queued-work pause") pause = live.session.acquireQueuedWorkPause();
+				release.resolve();
+				await Promise.allSettled([delivery]);
+				await live.session.waitForSessionInputIdle();
+				expect(live.session.isQueuedWorkSuspended).toBe(true);
+				expect(live.session.messages.some((m) => JSON.stringify(m).includes("preflight race"))).toBe(false);
+				expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([delivery]);
+				pause?.release();
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["new abort", "queued-work pause"] as const)(
+		"queued native retry preserves work when %s races its preflight",
+		async (race) => {
+			const h = harness();
+			await h.authenticate("native");
+			const entered = createDeferred();
+			const release = createDeferred();
+			const live = await createHarness({
+				persistSession: true,
+				tools: [
+					{
+						name: "queued_preflight_hold",
+						label: "hold",
+						description: "test gate",
+						parameters: Type.Object({}),
+						execute: async () => {
+							entered.resolve();
+							await release.promise;
+							return { content: [], details: {} };
+						},
+					},
+				],
+			});
+			const state = makeState("target");
+			state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			live.setResponses([
+				fauxAssistantMessage(fauxToolCall("queued_preflight_hold", {}), { stopReason: "toolUse" }),
+			]);
+			const command = {
+				type: "worker_native_mesh_deliver_message",
+				targetActiveSessionId: "target",
+				expectedSessionId: live.session.sessionId,
+				message: "queued preflight race",
+				sender: { sessionId: "sender" },
+				requestId: `nm1m-${"e2".repeat(32)}`,
+				attemptToken: "first",
+			} as const;
+			const id = `agentmsg_native-mesh:${command.requestId}`;
+			const control = live.session.prompt("hold");
+			void control.catch(() => undefined);
+			const checking = createDeferred();
+			const continueCheck = createDeferred();
+			let delivery: Promise<void> | undefined;
+			let pause: { release(): void } | undefined;
+			try {
+				await entered.promise;
+				await live.session.followUp("old work");
+				await h.internals.receiveMeshMessage(h.client, command);
+				expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+				live.session.requestAbort();
+				release.resolve();
+				await Promise.allSettled([control]);
+				await live.session.waitForSessionInputIdle();
+				const internal = live.session as unknown as { _validateCanStartAgentRun(): Promise<void> };
+				const original = internal._validateCanStartAgentRun.bind(live.session);
+				vi.spyOn(internal, "_validateCanStartAgentRun").mockImplementation(async () => {
+					checking.resolve();
+					await continueCheck.promise;
+					await original();
+				});
+				delivery = h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "retry" });
+				void delivery.catch(() => undefined);
+				await checking.promise;
+				if (race === "new abort") live.session.requestAbort();
+				else pause = live.session.acquireQueuedWorkPause();
+				continueCheck.resolve();
+				await Promise.allSettled([delivery]);
+				await live.session.waitForSessionInputIdle();
+				expect(live.session.isQueuedWorkSuspended).toBe(true);
+				expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+				expect(live.session.getSessionActionSnapshot().followUps).toContain("old work");
+				expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			} finally {
+				release.resolve();
+				continueCheck.resolve();
+				await Promise.allSettled([control, ...(delivery ? [delivery] : [])]);
+				pause?.release();
+				live.cleanup();
+			}
+		},
+	);
+
+	it.each(["abort", "pause", "clear", "supersession"] as const)(
+		"native admission remains suspended when %s wins during its second preflight",
+		async (race) => {
+			const h = harness();
+			await h.authenticate("native");
+			const live = await createHarness({ persistSession: true });
+			const state = makeState("target");
+			state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+			h.internals.sessions.set("target", state);
+			live.session.requestAbort();
+			const command = {
+				type: "worker_native_mesh_deliver_message",
+				targetActiveSessionId: "target",
+				expectedSessionId: live.session.sessionId,
+				message: "second preflight race",
+				sender: { sessionId: "sender" },
+				requestId: `nm1m-${"e3".repeat(32)}`,
+				attemptToken: "first",
+			} as const;
+			const id = `agentmsg_native-mesh:${command.requestId}`;
+			const checking = createDeferred();
+			const resumeCheck = createDeferred();
+			const retryEntered = createDeferred();
+			const resumeRetry = createDeferred();
+			const internal = live.session as unknown as { _validateCanStartAgentRun(): Promise<void> };
+			const original = internal._validateCanStartAgentRun.bind(live.session);
+			let checks = 0;
+			vi.spyOn(internal, "_validateCanStartAgentRun").mockImplementation(async () => {
+				if (++checks === 2) {
+					checking.resolve();
+					await resumeCheck.promise;
+				}
+				await original();
+			});
+			const wake = live.session.wakeQueuedNativeMessage.bind(live.session);
+			if (race === "supersession")
+				vi.spyOn(live.session, "wakeQueuedNativeMessage").mockImplementation(async (...args) => {
+					retryEntered.resolve();
+					await resumeRetry.promise;
+					await wake(...args);
+				});
+			const first = h.internals.receiveMeshMessage(h.client, command);
+			void first.catch(() => undefined);
+			let second: Promise<void> | undefined;
+			let pause: { release(): void } | undefined;
+			try {
+				await checking.promise;
+				expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+				if (race === "abort") live.session.requestAbort();
+				if (race === "pause") pause = live.session.acquireQueuedWorkPause();
+				if (race === "clear") live.session.clearQueuedAgentMessages();
+				if (race === "supersession") {
+					second = h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "retry" });
+					void second.catch(() => undefined);
+				}
+				resumeCheck.resolve();
+				if (race === "supersession") await retryEntered.promise;
+				else await Promise.allSettled([first]);
+				expect(live.session.isQueuedWorkSuspended).toBe(true);
+				expect(live.session.hasQueuedAgentMessage(id)).toBe(race !== "clear");
+				expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			} finally {
+				resumeCheck.resolve();
+				resumeRetry.resolve();
+				await Promise.allSettled([first, ...(second ? [second] : [])]);
+				pause?.release();
+				live.cleanup();
+			}
+		},
+	);
+
+	it("native second preflight failure keeps admission for same-ID retry and natural ACK", async () => {
+		const h = harness();
+		await h.authenticate("native");
+		const live = await createHarness({ persistSession: true });
+		const state = makeState("target");
+		state.runtime = { ...state.runtime, session: live.session } as ActiveSessionState["runtime"];
+		h.internals.sessions.set("target", state);
+		live.session.requestAbort();
+		const command = {
+			type: "worker_native_mesh_deliver_message",
+			targetActiveSessionId: "target",
+			expectedSessionId: live.session.sessionId,
+			message: "retry after preflight failure",
+			sender: { sessionId: "sender" },
+			requestId: `nm1m-${"e4".repeat(32)}`,
+			attemptToken: "first",
+		} as const;
+		const id = `agentmsg_native-mesh:${command.requestId}`;
+		const internal = live.session as unknown as { _validateCanStartAgentRun(): Promise<void> };
+		const original = internal._validateCanStartAgentRun.bind(live.session);
+		let checks = 0;
+		const validate = vi.spyOn(internal, "_validateCanStartAgentRun").mockImplementation(async () => {
+			if (++checks === 2) throw new Error("preflight failure");
+			await original();
+		});
+		const accept = vi.spyOn(live.session, "acceptSuspendedNativeMessage");
+		try {
+			await h.internals.receiveMeshMessage(h.client, command);
+			expect(live.session.isQueuedWorkSuspended).toBe(true);
+			expect(live.session.hasQueuedAgentMessage(id)).toBe(true);
+			expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+			validate.mockRestore();
+			live.setResponses([fauxAssistantMessage("done")]);
+			await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "retry" });
+			await vi.waitFor(() =>
+				expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([
+					{ type: "native_mesh_message_persisted", requestId: command.requestId, attemptToken: "retry" },
+				]),
+			);
+			await live.session.waitForSessionInputIdle();
+			expect(accept).toHaveBeenCalledTimes(1);
+			expect(
+				live.sessionManager
+					.getEntries()
+					.filter((e) => e.type === "custom_message" && (e.details as { id?: string })?.id === id),
+			).toHaveLength(1);
+		} finally {
+			live.cleanup();
+		}
+	});
+
 	it.each(["open", "reconnect"] as const)(
 		"native retries stay bounded while a real tool keeps delivery queued (%s)",
 		async (mode) => {
@@ -6235,7 +6878,12 @@ describe("mesh worker persistence", () => {
 		]);
 		// No prompt, response, token, sender, or attempt data is passed to the recorder.
 		for (const [event] of diagnostic.mock.calls) {
-			expect(event).toEqual({ stage: event.stage, status: event.status, subject: command.requestId, component: "worker" });
+			expect(event).toEqual({
+				stage: event.stage,
+				status: event.status,
+				subject: command.requestId,
+				component: "worker",
+			});
 		}
 		diagnostic.mockImplementation(() => {
 			throw new Error("diagnostic failure");

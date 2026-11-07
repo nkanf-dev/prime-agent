@@ -47,6 +47,7 @@ import {
 	AGENT_MESSAGE_SKILL_NAME,
 	type AgentFamilyCatalogEntry,
 	AgentMessageClearedError,
+	AgentMessageQueueCapacityError,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
@@ -5930,6 +5931,90 @@ export class AgentSession {
 		if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 	}
 
+	/** Snapshot the scheduler generation before a native delivery waits for admission. */
+	get nativeMessageInputEpoch(): number {
+		return this._sessionInputPumpEpoch;
+	}
+
+	private _canWakeNativeMessage(epoch: number): boolean {
+		return (
+			epoch === this._sessionInputPumpEpoch &&
+			this._sessionInputPumpSuspended &&
+			!this._sessionInputSuspendedForUpdateRestart &&
+			!this._disposed &&
+			!this._disposing &&
+			this._sessionInputAdmissionPauses.size === 0 &&
+			this._queuedWorkPauses.size === 0
+		);
+	}
+
+	/** Resume only an already-admitted native message, never an old scheduler generation. */
+	async wakeQueuedNativeMessage(id: string, epoch: number, validate: () => void): Promise<void> {
+		if (!this._canWakeNativeMessage(epoch)) return;
+		const fence = await this._acquireSessionActionCommitFence();
+		try {
+			if (!this._canWakeNativeMessage(epoch) || !this.hasQueuedAgentMessage(id)) return;
+			validate();
+			await this._validateCanStartAgentRun();
+			if (!this._canWakeNativeMessage(epoch) || !this.hasQueuedAgentMessage(id)) return;
+			validate();
+			if (!this._canWakeNativeMessage(epoch) || !this.hasQueuedAgentMessage(id)) return;
+			this._resumeSessionInputAdmission();
+			this._scheduleSessionInputPump();
+		} finally {
+			fence.release();
+		}
+	}
+
+	/** Admit a native message before waking an ordinary abort suspension. */
+	async acceptSuspendedNativeMessage(
+		message: AgentSessionMessage,
+		epoch: number,
+		validate: () => void,
+	): Promise<boolean> {
+		if (!this._sessionInputPumpSuspended) return false;
+		const clearEpoch = this._agentMessageClearEpoch;
+		const fence = await this._acquireSessionActionCommitFence();
+		try {
+			if (!this._canWakeNativeMessage(epoch)) throw new Error("Session input is suspended or invalidated");
+			validate();
+			await this._validateCanStartAgentRun();
+			if (!this._canWakeNativeMessage(epoch)) throw new Error("Session input was invalidated before admission");
+			validate();
+			if (clearEpoch !== this._agentMessageClearEpoch || this._replacingAgentMessageIds.has(message.details.id)) {
+				throw new AgentMessageClearedError("Agent message was cleared or held before admission");
+			}
+			if (!this._canWakeNativeMessage(epoch)) throw new Error("Session input was invalidated before admission");
+			const action = this._createPreparedTurnAction("steer", message.content, undefined, {
+				agentMessageId: message.details.id,
+				message,
+				acceptedAgentMessage: true,
+				acceptedBeforeCompletion: true,
+			});
+			const result = this._admitSessionInput(action, { wake: false });
+			if (!result.accepted) throw new Error("Agent message was not accepted");
+			if (message.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
+			// Queue listeners may synchronously abort, pause, replace, or clear the action.
+			if (this._canWakeNativeMessage(epoch) && this.hasQueuedAgentMessage(message.details.id)) {
+				try {
+					validate();
+					await this._validateCanStartAgentRun();
+					if (!this._canWakeNativeMessage(epoch) || !this.hasQueuedAgentMessage(message.details.id)) return true;
+					validate();
+					if (this._canWakeNativeMessage(epoch) && this.hasQueuedAgentMessage(message.details.id)) {
+						this._resumeSessionInputAdmission();
+						this._scheduleSessionInputPump();
+					}
+				} catch {
+					// Admission already succeeded. Leave the queue suspended for a later trigger.
+				}
+			}
+			return true;
+		} finally {
+			fence.release();
+		}
+	}
+
 	async queueAgentMessagePrompt(
 		text: string,
 		streamingBehavior: "steer" | "followUp",
@@ -6168,9 +6253,17 @@ export class AgentSession {
 					(visibleQueued ? this._turnExecutionPolicy("queued") : this._turnExecutionPolicy("injected")),
 				queueVisible: visibleQueued,
 			});
-			const result = this._admitSessionInput(action, {
-				immediatelyEligible: !visibleQueued,
-			});
+			let result: ReturnType<AgentSession["_admitSessionInput"]>;
+			try {
+				result = this._admitSessionInput(action, {
+					immediatelyEligible: !visibleQueued,
+				});
+			} catch (error) {
+				if (error instanceof AgentMessageQueueCapacityError && prefixMessages) {
+					this._pendingNextTurnMessages.unshift(...prefixMessages);
+				}
+				throw error;
+			}
 			admissionFence.release();
 			if (!result.accepted || !result.ticket) {
 				if (prefixMessages) this._pendingNextTurnMessages.unshift(...prefixMessages);
@@ -6350,9 +6443,17 @@ export class AgentSession {
 				if (action.suppressAutonomousContinuation) {
 					this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 				}
-				const result = this._admitSessionInput(action, {
-					immediatelyEligible: !visibleQueued && this._canStartSessionActionImmediately(),
-				});
+				let result: ReturnType<AgentSession["_admitSessionInput"]>;
+				try {
+					result = this._admitSessionInput(action, {
+						immediatelyEligible: !visibleQueued && this._canStartSessionActionImmediately(),
+					});
+				} catch (error) {
+					if (error instanceof AgentMessageQueueCapacityError && prefixMessages) {
+						this._pendingNextTurnMessages.unshift(...prefixMessages);
+					}
+					throw error;
+				}
 				commitFence?.release();
 				if (!result.accepted || !result.ticket) {
 					if (prefixMessages) this._pendingNextTurnMessages.unshift(...prefixMessages);
@@ -6979,15 +7080,30 @@ export class AgentSession {
 				"Cannot admit a session action while session input admission is paused.",
 			);
 		}
-		if (
-			options.restore !== true &&
-			action.payload.kind === "turn" &&
-			isAgentSessionMessage(primaryDeliveryRecord(action).message)
-		) {
-			assertAgentMessageQueueCapacity(
-				this._actionStore.unfinishedActions().length,
-				DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-			);
+		if (options.restore !== true && action.payload.kind === "turn") {
+			const incomingAgentMessageIds = new Set<string>();
+			for (const record of action.payload.records) {
+				if (isAgentSessionMessage(record.message)) incomingAgentMessageIds.add(record.message.details.id);
+			}
+			if (incomingAgentMessageIds.size > 0) {
+				// Count unique agent messages across unfinished and incoming records, including prefixes.
+				const pendingAgentMessageIds = new Set<string>();
+				for (const candidate of this._actionStore.unfinishedActions()) {
+					if (candidate.payload.kind !== "turn") continue;
+					for (const record of candidate.payload.records) {
+						if (isAgentSessionMessage(record.message)) pendingAgentMessageIds.add(record.message.details.id);
+					}
+				}
+				const previousCount = pendingAgentMessageIds.size;
+				for (const id of incomingAgentMessageIds) pendingAgentMessageIds.add(id);
+				if (pendingAgentMessageIds.size > previousCount) {
+					// The helper tests whether one more message fits; apply it to the final addition.
+					assertAgentMessageQueueCapacity(
+						pendingAgentMessageIds.size - 1,
+						DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+					);
+				}
+			}
 		}
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
