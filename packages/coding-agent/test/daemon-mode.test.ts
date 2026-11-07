@@ -71,6 +71,7 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { nativeMeshDiagnostic } from "../src/modes/daemon/native-mesh/diagnostic.js";
 import {
 	DAEMON_WORKER_MESH_REPLACEMENT_CAPABILITY,
 	type DaemonWorkerCommand,
@@ -4405,6 +4406,7 @@ describe("update restart checkpoint wait", () => {
 describe("mesh worker persistence", () => {
 	const roots: string[] = [];
 	afterEach(() => {
+		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
 		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 	});
@@ -6165,6 +6167,7 @@ describe("mesh worker persistence", () => {
 	});
 
 	it("native mesh only confirms after persistence and rejects conflicting retries", async () => {
+		const diagnostic = vi.spyOn(nativeMeshDiagnostic, "record").mockImplementation(() => {});
 		const h = harness();
 		await h.authenticate("native");
 		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
@@ -6213,6 +6216,29 @@ describe("mesh worker persistence", () => {
 			type: "native_mesh_message_persisted",
 			requestId: command.requestId,
 			attemptToken: "attempt-1",
+		});
+		expect(diagnostic.mock.calls.map(([event]) => [event.stage, event.status])).toEqual([
+			["handoff", "start"],
+			["handoff", "success"],
+			["admission", "start"],
+			["admission", "success"],
+			["model-processing", "unknown"],
+			["reply-generation", "unknown"],
+			["handoff", "start"],
+			["handoff", "failure"],
+			["handoff", "start"],
+			["handoff", "failure"],
+			["session-sync", "start"],
+			["session-sync", "success"],
+			["persisted-frame", "start"],
+			["persisted-frame", "success"],
+		]);
+		// No prompt, response, token, sender, or attempt data is passed to the recorder.
+		for (const [event] of diagnostic.mock.calls) {
+			expect(event).toEqual({ stage: event.stage, status: event.status, subject: command.requestId, component: "worker" });
+		}
+		diagnostic.mockImplementation(() => {
+			throw new Error("diagnostic failure");
 		});
 		await h.internals.receiveMeshMessage(h.client, { ...command, attemptToken: "attempt-2" });
 		expect(accept).toHaveBeenCalledTimes(1);
@@ -6327,6 +6353,7 @@ describe("mesh worker persistence", () => {
 	});
 
 	it("native mesh does not confirm an fsync failure and retries without another admission", async () => {
+		const diagnostic = vi.spyOn(nativeMeshDiagnostic, "record").mockImplementation(() => {});
 		const h = harness();
 		await h.authenticate("native");
 		const manager = SessionManager.create(h.root, join(h.root, "sessions"));
@@ -6367,6 +6394,11 @@ describe("mesh worker persistence", () => {
 		manager.appendCustomMessageEntry(accepted.customType, accepted.content, true, accepted.details);
 		expect(sync).toHaveBeenCalled();
 		expect(h.frames().filter((f) => f.type === "native_mesh_message_persisted")).toEqual([]);
+		expect(diagnostic.mock.calls.map(([event]) => [event.stage, event.status])).toContainEqual([
+			"session-sync",
+			"failure",
+		]);
+		expect(diagnostic.mock.calls.some(([event]) => event.stage === "persisted-frame")).toBe(false);
 		sync.mockRestore();
 		await h.internals.receiveMeshMessage(h.client, command);
 		expect(accept).toHaveBeenCalledTimes(1);

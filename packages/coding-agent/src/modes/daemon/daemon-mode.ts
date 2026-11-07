@@ -162,6 +162,7 @@ import {
 	workerRosterEntryFromSummary,
 } from "./agent-roster.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
+import { recordNativeMeshDiagnostic } from "./native-mesh/diagnostic.js";
 import { DaemonAutoReloadScheduler } from "./daemon-auto-reload.js";
 import { DaemonCapabilityUnavailableError } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
@@ -6829,6 +6830,18 @@ export class AgentDaemon {
 		ingress?: NativeMeshIngress,
 	): Promise<void> {
 		const native = command.type === "worker_native_mesh_deliver_message";
+		const trace = (
+			stage: "handoff" | "admission" | "session-sync" | "persisted-frame" | "delivery" | "model-processing" | "reply-generation",
+			status: "start" | "success" | "failure" | "drop" | "unknown",
+		) => {
+			if (!native) return;
+			try {
+				recordNativeMeshDiagnostic({ stage, status, subject: command.requestId, component: "worker" });
+			} catch {
+				// Diagnostics must not affect message delivery.
+			}
+		};
+		trace("handoff", "start");
 		if (native) {
 			if (
 				this.agentMessageTransport !== "native" ||
@@ -6837,8 +6850,10 @@ export class AgentDaemon {
 				!command.attemptToken ||
 				typeof command.expectedSessionId !== "string" ||
 				!command.expectedSessionId
-			)
+			) {
+				trace("handoff", "failure");
 				throw new Error("Invalid native mesh delivery");
+			}
 		} else if (
 			this.agentMessageTransport !== "cotal" ||
 			!command.cotal ||
@@ -6859,12 +6874,19 @@ export class AgentDaemon {
 			target = await this.hydratePassiveRlmSubagent(passive);
 		}
 		const recipientSession = target.runtime.session;
-		if (native && recipientSession.sessionId !== command.expectedSessionId)
+		if (native && recipientSession.sessionId !== command.expectedSessionId) {
+			trace("handoff", "failure");
 			throw new Error("Native mesh target session changed");
-		if (this.unsafeMeshSessions.has(recipientSession))
+		}
+		if (this.unsafeMeshSessions.has(recipientSession)) {
+			trace("handoff", "failure");
 			throw new Error("Mesh session must be reopened from disk after replacement failure");
+		}
 		const manager = recipientSession.sessionManager;
-		if (!manager.isPersisted() || !manager.getSessionFile()) throw new Error("Mesh target has no session file");
+		if (!manager.isPersisted() || !manager.getSessionFile()) {
+			trace("handoff", "failure");
+			throw new Error("Mesh target has no session file");
+		}
 
 		if (ingress && !ingress.current()) throw new Error("Superseded native mesh attempt");
 		if (manager.rewritesOnNextPersist()) {
@@ -6933,12 +6955,14 @@ export class AgentDaemon {
 			if (
 				(nativeFingerprints.has(payload.id) && nativeFingerprints.get(payload.id) !== expected) ||
 				(details && fingerprint(details.message, details.from, details.fromRelationship) !== expected)
-			)
+			) {
+				trace("handoff", "failure");
 				throw new Error("Native mesh request ID conflicts with existing delivery");
+			}
 			if (ingress && !ingress.adopt(recipientSession)) throw new Error("Superseded native mesh attempt");
 			nativeFingerprints.set(payload.id, expected);
 		}
-
+		trace("handoff", "success");
 		const messageIds = this.meshMessageIds.get(recipientSession) ?? new Set<string>();
 		if (!this.meshMessageIds.has(recipientSession)) {
 			this.meshMessageIds.set(recipientSession, messageIds);
@@ -7065,10 +7089,13 @@ export class AgentDaemon {
 			const entry = ownEntry();
 			if (!entry || !manager.isEntryPersisted(entry.id)) return;
 			if (native) {
+				trace("session-sync", "start");
 				try {
 					// File and parent directory must be durable before the supervisor ACKs.
 					manager.syncPersistedEntry(entry.id);
+					trace("session-sync", "success");
 				} catch {
+					trace("session-sync", "failure");
 					// Keep the broker message pending. A later handoff retries the sync.
 					this.log("Native mesh entry sync failed; retaining broker message for retry");
 					cleanup();
@@ -7083,6 +7110,7 @@ export class AgentDaemon {
 			}
 			sent = true;
 			cleanup();
+			trace("persisted-frame", "start");
 			client.socket.write(
 				encodePrivateFrame<DaemonWorkerFrameHeader>(
 					{ kind: "outbound", outboundType: native ? "native_mesh_message_persisted" : "agent_message_persisted" },
@@ -7095,6 +7123,7 @@ export class AgentDaemon {
 					),
 				),
 			);
+			trace("persisted-frame", "success");
 		};
 		const dropped = (error: unknown) => {
 			if (native && (!active || (ingress && !ingress.current()))) {
@@ -7115,6 +7144,7 @@ export class AgentDaemon {
 						? "closed"
 						: (this.closingSessions.get(target.activeSessionId)?.messageDropReason ?? "other");
 			if ((!accepted && reason === "other") || sent || !active) return;
+			trace("delivery", "drop");
 			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
 				cleanup();
 				return;
@@ -7186,6 +7216,7 @@ export class AgentDaemon {
 		}
 		let admissionFailed = false;
 		let admissionSucceeded = false;
+		trace("admission", "start");
 		try {
 			if (this.unsafeMeshSessions.has(recipientSession)) throw new Error("Mesh session is held for replacement");
 			let status: AgentSessionMessageDeliveryStatus;
@@ -7215,11 +7246,18 @@ export class AgentDaemon {
 			}
 			admissionSucceeded = true;
 			if (ingress && !ingress.current()) throw new Error("Superseded native mesh attempt");
+			trace("admission", "success");
+			// Session-level stream events can include other inputs, and the per-message
+			// delivery/completion outcomes do not prove model processing or a reply.
+			// Record uncertainty without extending any message observer's lifetime.
+			trace("model-processing", "unknown");
+			trace("reply-generation", "unknown");
 			this.writeWorkerSuccess(client, command, createAgentSessionMessageReceipt(payload, status));
 			accepted = true;
 			check();
 			if (deliveryFailure !== undefined) dropped(deliveryFailure);
 		} catch (error) {
+			if (!admissionSucceeded) trace("admission", "failure");
 			if (
 				(!currentObserver || !admissionSucceeded) &&
 				(!ingress || ingress.current() || admissionFailed) &&

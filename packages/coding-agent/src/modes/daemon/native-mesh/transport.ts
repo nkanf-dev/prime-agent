@@ -6,6 +6,7 @@
  * authenticate, authorize and durably deduplicate before acknowledging.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { recordNativeMeshDiagnostic } from "./diagnostic.js";
 
 const utf8 = new TextEncoder();
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -113,12 +114,28 @@ export class NativeMeshRequestError extends Error {
 	}
 }
 
+type TracedOperation = "register" | "discover" | "pending";
+
+function validationFailure(operation: TracedOperation): NativeMeshRequestError {
+	recordNativeMeshDiagnostic({
+		component: "supervisor",
+		operation,
+		stage: "validation",
+		status: "failure",
+		reason: "invalid",
+	});
+	return new NativeMeshRequestError(operation, "unknown");
+}
+
 export interface NativeMeshTransportOptions {
 	url: string;
 	token: string;
 	/** Base64url EnvInHands registration declaration; it is not authentication. */
 	registration?: string;
+	/** Per-request timeout; an explicit value also preserves the discovery budget unless overridden. */
 	timeoutMs?: number;
+	/** Total deadline for a consistent discovery scan, including 409 retries. */
+	discoveryTimeoutMs?: number;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -165,6 +182,7 @@ async function boundedJson(response: Response, account?: (bytes: number) => void
 export class NativeMeshTransport {
 	private readonly base: URL;
 	private readonly timeoutMs: number;
+	private readonly discoveryTimeoutMs: number;
 	constructor(private readonly options: NativeMeshTransportOptions) {
 		this.base = new URL(options.url);
 		const local =
@@ -184,6 +202,13 @@ export class NativeMeshTransport {
 		this.timeoutMs = options.timeoutMs ?? 10_000;
 		if (!Number.isInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 120_000)
 			throw new Error("Invalid timeout");
+		this.discoveryTimeoutMs = options.discoveryTimeoutMs ?? options.timeoutMs ?? 60_000;
+		if (
+			!Number.isInteger(this.discoveryTimeoutMs) ||
+			this.discoveryTimeoutMs < 1 ||
+			this.discoveryTimeoutMs > 120_000
+		)
+			throw new Error("Invalid discovery timeout");
 	}
 
 	private async request(
@@ -193,6 +218,10 @@ export class NativeMeshTransport {
 		body?: object,
 		budget?: { deadline: number; account: (bytes: number) => void },
 	): Promise<unknown> {
+		const traced =
+			operation === "register" || operation === "discover" || operation === "pending" ? operation : undefined;
+		if (traced)
+			recordNativeMeshDiagnostic({ component: "supervisor", operation: traced, stage: "request", status: "start" });
 		const headers: Record<string, string> = { authorization: `Bearer ${this.options.token}` };
 		if (body !== undefined) headers["content-type"] = "application/json";
 		if (method === "POST" && this.options.registration) {
@@ -201,7 +230,17 @@ export class NativeMeshTransport {
 		}
 		let response: Response;
 		const remaining = budget ? Math.min(this.timeoutMs, budget.deadline - Date.now()) : this.timeoutMs;
-		if (remaining < 1) throw new NativeMeshRequestError(operation, "unknown");
+		if (remaining < 1) {
+			if (traced)
+				recordNativeMeshDiagnostic({
+					component: "supervisor",
+					operation: traced,
+					stage: "request",
+					status: "failure",
+					reason: "timeout",
+				});
+			throw new NativeMeshRequestError(operation, "unknown");
+		}
 		try {
 			response = await fetch(new URL(path, this.base), {
 				method,
@@ -211,9 +250,26 @@ export class NativeMeshTransport {
 				signal: AbortSignal.timeout(remaining),
 			});
 		} catch {
+			if (traced)
+				recordNativeMeshDiagnostic({
+					component: "supervisor",
+					operation: traced,
+					stage: "request",
+					status: "failure",
+					reason: "other",
+				});
 			throw new NativeMeshRequestError(operation, "unknown");
 		}
 		if (!response.ok) {
+			if (traced)
+				recordNativeMeshDiagnostic({
+					component: "supervisor",
+					operation: traced,
+					stage: "response",
+					status: "failure",
+					reason: "http",
+					httpStatus: response.status,
+				});
 			void response.body?.cancel().catch(() => {});
 			throw new NativeMeshRequestError(
 				operation,
@@ -224,13 +280,33 @@ export class NativeMeshTransport {
 		try {
 			return await boundedJson(response, budget?.account);
 		} catch {
+			if (traced)
+				recordNativeMeshDiagnostic({
+					component: "supervisor",
+					operation: traced,
+					stage: "response",
+					status: "failure",
+					reason: "other",
+					httpStatus: response.status,
+				});
 			throw new NativeMeshRequestError(operation, "unknown", response.status);
 		}
 	}
 
 	/** Publish a heartbeat. This declaration does not prove agent identity. */
 	async register(input: NativeMeshRegistration): Promise<NativeMeshObservation> {
-		validateRegistration(input);
+		try {
+			validateRegistration(input);
+		} catch (error) {
+			recordNativeMeshDiagnostic({
+				component: "supervisor",
+				operation: "register",
+				stage: "validation",
+				status: "failure",
+				reason: "invalid",
+			});
+			throw error;
+		}
 		const result = record(await this.request("register", "/v1/native-mesh/agents", "POST", input));
 		const agent = observation(result?.agent);
 		if (
@@ -241,7 +317,13 @@ export class NativeMeshTransport {
 			agent.parentId !== input.parentId ||
 			agent.state !== input.state
 		)
-			throw new NativeMeshRequestError("register", "unknown");
+			throw validationFailure("register");
+		recordNativeMeshDiagnostic({
+			component: "supervisor",
+			operation: "register",
+			stage: "validation",
+			status: "success",
+		});
 		return agent;
 	}
 
@@ -252,7 +334,9 @@ export class NativeMeshTransport {
 	 * is exceeded, rather than receiving a silently truncated directory.
 	 */
 	async discover(): Promise<NativeMeshObservation[]> {
-		const deadline = Date.now() + this.timeoutMs;
+		const started = Date.now();
+		const deadline = started + this.discoveryTimeoutMs;
+		let pages = 0;
 		let bytes = 0,
 			records = 0;
 		const budget = {
@@ -276,9 +360,10 @@ export class NativeMeshTransport {
 					const result = record(
 						await this.request("discover", `/v1/native-mesh/agents?${query}`, "GET", undefined, budget),
 					);
-					if (!Array.isArray(result?.agents)) throw new NativeMeshRequestError("discover", "unknown");
+					if (!Array.isArray(result?.agents)) throw validationFailure("discover");
 					const agents = result.agents.map(observation);
-					if (agents.some((a) => !a)) throw new NativeMeshRequestError("discover", "unknown");
+					if (agents.some((a) => !a)) throw validationFailure("discover");
+					pages++;
 					if (result.version === undefined && after === undefined) {
 						// Legacy servers returned the entire directory, without a cursor.
 						if (
@@ -286,7 +371,23 @@ export class NativeMeshTransport {
 							"revision" in result ||
 							new Set(agents.map((a) => a!.id)).size !== agents.length
 						)
-							throw new NativeMeshRequestError("discover", "unknown");
+							throw validationFailure("discover");
+						recordNativeMeshDiagnostic({
+							component: "supervisor",
+							operation: "discover",
+							stage: "validation",
+							status: "success",
+							count: agents.length,
+						});
+						recordNativeMeshDiagnostic({
+							component: "supervisor",
+							operation: "discover",
+							stage: "discover",
+							status: "success",
+							count: pages,
+							bytes,
+							durationMs: Math.max(0, Date.now() - started),
+						});
 						return agents as NativeMeshObservation[];
 					}
 					if (
@@ -296,20 +397,58 @@ export class NativeMeshTransport {
 						(revision !== undefined && revision !== result.revision) ||
 						agents.length > 100
 					)
-						throw new NativeMeshRequestError("discover", "unknown");
+						throw validationFailure("discover");
 					revision = result.revision;
 					for (const agent of agents as NativeMeshObservation[]) {
-						if (after !== undefined && agent.id <= after) throw new NativeMeshRequestError("discover", "unknown");
+						if (after !== undefined && agent.id <= after) throw validationFailure("discover");
 						after = agent.id;
 						all.push(agent);
-						if (++records > 100_000) throw new NativeMeshRequestError("discover", "unknown");
+						if (++records > 100_000) throw validationFailure("discover");
 					}
-					if (result.nextCursor === null) return all;
-					if (agents.length === 0 || result.nextCursor !== after)
-						throw new NativeMeshRequestError("discover", "unknown");
+					if (result.nextCursor === null) {
+						recordNativeMeshDiagnostic({
+							component: "supervisor",
+							operation: "discover",
+							stage: "validation",
+							status: "success",
+							count: all.length,
+						});
+						recordNativeMeshDiagnostic({
+							component: "supervisor",
+							operation: "discover",
+							stage: "discover",
+							status: "success",
+							count: pages,
+							bytes,
+							durationMs: Math.max(0, Date.now() - started),
+						});
+						return all;
+					}
+					if (agents.length === 0 || result.nextCursor !== after) throw validationFailure("discover");
 				}
 			} catch (error) {
-				if (error instanceof NativeMeshRequestError && error.status === 409 && attempt < 2) continue;
+				if (error instanceof NativeMeshRequestError && error.status === 409 && attempt < 2) {
+					recordNativeMeshDiagnostic({
+						component: "supervisor",
+						operation: "discover",
+						stage: "discover",
+						status: "skipped",
+						httpStatus: 409,
+						count: pages,
+						bytes,
+						durationMs: Math.max(0, Date.now() - started),
+					});
+					continue;
+				}
+				recordNativeMeshDiagnostic({
+					component: "supervisor",
+					operation: "discover",
+					stage: "discover",
+					status: "unknown",
+					count: pages,
+					bytes,
+					durationMs: Math.max(0, Date.now() - started),
+				});
 				throw error;
 			}
 		}
@@ -335,9 +474,22 @@ export class NativeMeshTransport {
 		)
 			throw new Error("Invalid native mesh message text");
 		const requestId = nativeMeshRequestId(from, input.callerMessageId);
-		const result = record(
-			await this.request("store", "/v1/messages", "POST", { requestId, from, to, text: input.text }),
-		);
+		const started = Date.now();
+		recordNativeMeshDiagnostic({ component: "supervisor", stage: "store", status: "start", subject: requestId });
+		let response: unknown;
+		try {
+			response = await this.request("store", "/v1/messages", "POST", { requestId, from, to, text: input.text });
+		} catch (error) {
+			recordNativeMeshDiagnostic({
+				component: "supervisor",
+				stage: "store",
+				status: "unknown",
+				subject: requestId,
+				durationMs: Date.now() - started,
+			});
+			throw error;
+		}
+		const result = record(response);
 		const m = message(result?.message);
 		if (
 			result?.status !== "accepted" ||
@@ -346,16 +498,40 @@ export class NativeMeshTransport {
 			m.from !== from ||
 			m.to !== to ||
 			m.text !== input.text
-		)
+		) {
+			recordNativeMeshDiagnostic({
+				component: "supervisor",
+				stage: "store",
+				status: "unknown",
+				subject: requestId,
+				durationMs: Date.now() - started,
+			});
 			throw new NativeMeshRequestError("store", "unknown");
+		}
+		recordNativeMeshDiagnostic({
+			component: "supervisor",
+			stage: "store",
+			status: "success",
+			subject: requestId,
+			durationMs: Date.now() - started,
+		});
 		return { requestId, deliveryStatus: "stored" };
 	}
 
 	/** Untrusted, unclaimed data; do not execute or acknowledge before durable handling. */
 	async pending(to: string): Promise<NativeMeshMessage[]> {
-		if (!/^nm1-[a-f0-9]{64}$/.test(to)) throw new Error("Invalid native mesh endpoint");
+		if (!/^nm1-[a-f0-9]{64}$/.test(to)) {
+			recordNativeMeshDiagnostic({
+				component: "supervisor",
+				operation: "pending",
+				stage: "validation",
+				status: "failure",
+				reason: "invalid",
+			});
+			throw new Error("Invalid native mesh endpoint");
+		}
 		const result = record(await this.request("pending", `/v1/messages?to=${encodeURIComponent(to)}`, "GET"));
-		if (!Array.isArray(result?.messages)) throw new NativeMeshRequestError("pending", "unknown");
+		if (!Array.isArray(result?.messages)) throw validationFailure("pending");
 		const messages = result.messages.map(message);
 		if (
 			messages.some(
@@ -372,7 +548,14 @@ export class NativeMeshTransport {
 			) ||
 			new Set(messages.map((m) => m!.requestId)).size !== messages.length
 		)
-			throw new NativeMeshRequestError("pending", "unknown");
+			throw validationFailure("pending");
+		recordNativeMeshDiagnostic({
+			component: "supervisor",
+			operation: "pending",
+			stage: "validation",
+			status: "success",
+			count: messages.length,
+		});
 		return messages as NativeMeshMessage[];
 	}
 

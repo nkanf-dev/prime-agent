@@ -201,6 +201,7 @@ import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import { type NativeMeshConfig, nativeMeshConfigFromEnvironment } from "./native-mesh/config.js";
 import { NativeMeshOperations } from "./native-mesh/operations.js";
 import { NativeMeshOutbox } from "./native-mesh/outbox.js";
+import { nativeMeshDiagnostic } from "./native-mesh/diagnostic.js";
 import { type NativeMeshObservation, NativeMeshTransport, nativeMeshAgentId } from "./native-mesh/transport.js";
 import {
 	createRlmLedgerRegistrySeedSource,
@@ -4384,7 +4385,11 @@ export class DaemonSupervisor {
 			}
 		}
 		// Never route an endpoint to an ambiguous local session.
-		return result.filter((item) => result.filter((other) => item.id === other.id).length === 1);
+		const qualified = result.filter((item) => result.filter((other) => item.id === other.id).length === 1);
+		nativeMeshDiagnostic.record({ component: "supervisor", stage: "endpoint", status: "success", count: qualified.length });
+		for (const item of qualified)
+			nativeMeshDiagnostic.record({ component: "supervisor", stage: "endpoint", status: "success", peer: item.id });
+		return qualified;
 	}
 
 	private nativeObservationDepth(observation: NativeMeshObservation): number | undefined {
@@ -4442,8 +4447,14 @@ export class DaemonSupervisor {
 
 	private scheduleNativeMeshSweep(): void {
 		if (this.shuttingDown || this.nativeMeshSweep || !this.nativeMesh) return;
+		const started = Date.now();
+		nativeMeshDiagnostic.record({ component: "supervisor", stage: "sweep", status: "start" });
 		this.nativeMeshSweep = this.sweepNativeMesh()
+			.then(() => {
+				nativeMeshDiagnostic.record({ component: "supervisor", stage: "sweep", status: this.shuttingDown ? "skipped" : "success", durationMs: Math.max(0, Date.now() - started) });
+			})
 			.catch(() => {
+				nativeMeshDiagnostic.record({ component: "supervisor", stage: "sweep", status: "unknown", durationMs: Math.max(0, Date.now() - started) });
 				// Never log a broker response or bearer token.
 				if (!this.shuttingDown) this.log("Native mesh synchronization failed; retrying");
 			})
@@ -4459,7 +4470,7 @@ export class DaemonSupervisor {
 			if (!attempt.confirming && Date.now() - attempt.started > 120_000) this.nativeAttempts.delete(id);
 		}
 		const endpoints = this.nativeLocalEndpoints();
-		await Promise.allSettled(
+		const registered = await Promise.allSettled(
 			endpoints.map(async (endpoint) => {
 				const rawPrefix = process.env.PRIME_AGENT_TEAM_DISPLAY_PREFIX?.trim() || config.machineId || hostname();
 				const rawName = endpoint.summary.sessionName?.trim() || endpoint.summary.sessionId;
@@ -4469,45 +4480,126 @@ export class DaemonSupervisor {
 					Buffer.byteLength(displayName) <= 128 && !/[\u0000-\u001f\u007f]/.test(displayName)
 						? displayName
 						: endpoint.id;
-				await transport.register({
-					hostId: config.machineId,
-					agentId: endpoint.summary.sessionId,
-					parentId: endpoint.parentId,
-					name,
-					state: "active",
-				});
+				const started = Date.now();
+				nativeMeshDiagnostic.record({ component: "supervisor", stage: "register", status: "start", peer: endpoint.id });
+				try {
+					await transport.register({
+						hostId: config.machineId,
+						agentId: endpoint.summary.sessionId,
+						parentId: endpoint.parentId,
+						name,
+						state: "active",
+					});
+					nativeMeshDiagnostic.record({ component: "supervisor",
+						stage: "register",
+						status: "success",
+						peer: endpoint.id,
+						durationMs: Math.max(0, Date.now() - started),
+					});
+				} catch (error) {
+					nativeMeshDiagnostic.record({ component: "supervisor",
+						stage: "register",
+						status: "unknown",
+						peer: endpoint.id,
+						durationMs: Math.max(0, Date.now() - started),
+					});
+					throw error;
+				}
 			}),
 		);
+		nativeMeshDiagnostic.record({ component: "supervisor",
+			stage: "register",
+			status: "success",
+			count: registered.filter((result) => result.status === "fulfilled").length,
+		});
+		nativeMeshDiagnostic.record({ component: "supervisor",
+			stage: "register",
+			status: "unknown",
+			count: registered.filter((result) => result.status === "rejected").length,
+		});
 		if (this.shuttingDown) return;
 		// The durable binding is also send intent. Recover a crash after binding but
 		// before outbox enqueue; sending twice uses the exact same broker ID.
-		for (const id of this.nativeOperations!.pending()) {
-			const operation = this.nativeOperations!.read(id);
-			this.nativeOutbox!.enqueue({
-				from: operation.from,
-				to: operation.to,
-				text: operation.text,
-				callerMessageId: operation.operationId,
+		const recoveryStarted = Date.now();
+		nativeMeshDiagnostic.record({ component: "supervisor", stage: "outbox-recovery", status: "start" });
+		try {
+			for (const id of this.nativeOperations!.pending()) {
+				const operation = this.nativeOperations!.read(id);
+				this.nativeOutbox!.enqueue({
+					from: operation.from,
+					to: operation.to,
+					text: operation.text,
+					callerMessageId: operation.operationId,
+				});
+			}
+			for (const id of this.nativeOutbox!.pending()) {
+				if (this.shuttingDown) return;
+				void this.sendNativeOutbox(id).catch(() => undefined);
+			}
+			nativeMeshDiagnostic.record({ component: "supervisor", stage: "outbox-recovery", status: "success", durationMs: Math.max(0, Date.now() - recoveryStarted) });
+		} catch (error) {
+			nativeMeshDiagnostic.record({ component: "supervisor", stage: "outbox-recovery", status: "failure", durationMs: Math.max(0, Date.now() - recoveryStarted) });
+			throw error;
+		}
+		const discoveryStarted = Date.now();
+		nativeMeshDiagnostic.record({ component: "supervisor", stage: "discover", status: "start" });
+		let discovered: NativeMeshObservation[];
+		try {
+			discovered = await transport.discover();
+			nativeMeshDiagnostic.record({ component: "supervisor",
+				stage: "discover",
+				status: "success",
+				count: discovered.length,
+				durationMs: Math.max(0, Date.now() - discoveryStarted),
 			});
+		} catch (error) {
+			nativeMeshDiagnostic.record({ component: "supervisor",
+				stage: "discover",
+				status: "unknown",
+				durationMs: Math.max(0, Date.now() - discoveryStarted),
+			});
+			throw error;
 		}
-		for (const id of this.nativeOutbox!.pending()) {
-			if (this.shuttingDown) return;
-			void this.sendNativeOutbox(id).catch(() => undefined);
-		}
-		const discovered = await transport.discover();
 		if (this.shuttingDown) return;
 		this.nativeObservations = new Map(discovered.map((entry) => [entry.id, entry]));
-		await Promise.allSettled(
+		const pendingResults = await Promise.allSettled(
 			endpoints.map(async (endpoint) => {
-				const messages = await transport.pending(endpoint.id);
+				const started = Date.now();
+				nativeMeshDiagnostic.record({ component: "supervisor", stage: "pending", status: "start", peer: endpoint.id });
+				let messages: Awaited<ReturnType<NativeMeshTransport["pending"]>>;
+				try {
+					messages = await transport.pending(endpoint.id);
+					nativeMeshDiagnostic.record({ component: "supervisor",
+						stage: "pending",
+						status: "success",
+						peer: endpoint.id,
+						count: messages.length,
+						durationMs: Math.max(0, Date.now() - started),
+					});
+				} catch (error) {
+					nativeMeshDiagnostic.record({ component: "supervisor",
+						stage: "pending",
+						status: "unknown",
+						peer: endpoint.id,
+						durationMs: Math.max(0, Date.now() - started),
+					});
+					throw error;
+				}
 				for (const message of messages) {
 					if (this.shuttingDown) return;
 					const old = this.nativeAttempts.get(message.requestId);
 					if (
 						old &&
 						(old.confirming || (Date.now() - old.started < 60_000 && old.source === endpoint.worker.client))
-					)
+					) {
+						nativeMeshDiagnostic.record({ component: "supervisor",
+							stage: "handoff",
+							status: "skipped",
+							peer: endpoint.id,
+							subject: message.requestId,
+						});
 						continue;
+					}
 					const recipient = this.nativeObservations.get(endpoint.id);
 					const sender = this.nativeObservations.get(message.from);
 					const recipientFamily = recipient && this.nativeFamilyEntry(recipient);
@@ -4517,13 +4609,40 @@ export class DaemonSupervisor {
 						!senderFamily ||
 						message.from === endpoint.id ||
 						!agentFamilyRelationship(recipientFamily, senderFamily)
-					)
+					) {
+						nativeMeshDiagnostic.record({ component: "supervisor",
+							stage: "family",
+							status: "skipped",
+							peer: endpoint.id,
+							subject: message.requestId,
+						});
 						continue;
+					}
+					nativeMeshDiagnostic.record({ component: "supervisor",
+						stage: "family",
+						status: "success",
+						peer: endpoint.id,
+						subject: message.requestId,
+					});
 					const source = endpoint.worker.client;
-					if (!source) continue;
+					if (!source) {
+						nativeMeshDiagnostic.record({ component: "supervisor",
+							stage: "handoff",
+							status: "skipped",
+							peer: endpoint.id,
+							subject: message.requestId,
+						});
+						continue;
+					}
 					const token = randomUUID();
 					const attempt = { source, token, started: Date.now() };
 					this.nativeAttempts.set(message.requestId, attempt);
+					nativeMeshDiagnostic.record({ component: "supervisor",
+						stage: "handoff",
+						status: "start",
+						peer: endpoint.id,
+						subject: message.requestId,
+					});
 					// Bind the attempt before the request: persistence may be reported before its response.
 					void source
 						.requestWorker(
@@ -4540,16 +4659,40 @@ export class DaemonSupervisor {
 							30_000,
 						)
 						.then((response) => {
+							nativeMeshDiagnostic.record({ component: "supervisor",
+								stage: "handoff",
+								status: response.success ? "success" : "failure",
+								peer: endpoint.id,
+								subject: message.requestId,
+								durationMs: Date.now() - attempt.started,
+							});
 							if (!response.success && this.nativeAttempts.get(message.requestId) === attempt)
 								this.nativeAttempts.delete(message.requestId);
 						})
 						.catch(() => {
+							nativeMeshDiagnostic.record({ component: "supervisor",
+								stage: "handoff",
+								status: "unknown",
+								peer: endpoint.id,
+								subject: message.requestId,
+								durationMs: Date.now() - attempt.started,
+							});
 							if (this.nativeAttempts.get(message.requestId) === attempt)
 								this.nativeAttempts.delete(message.requestId);
 						});
 				}
 			}),
 		);
+		nativeMeshDiagnostic.record({ component: "supervisor",
+			stage: "pending",
+			status: "success",
+			count: pendingResults.filter((result) => result.status === "fulfilled").length,
+		});
+		nativeMeshDiagnostic.record({ component: "supervisor",
+			stage: "pending",
+			status: "unknown",
+			count: pendingResults.filter((result) => result.status === "rejected").length,
+		});
 	}
 
 	private async sendNativeOutbox(id: string): Promise<void> {
@@ -4570,9 +4713,23 @@ export class DaemonSupervisor {
 		if (this.shuttingDown || this.nativeAttempts.get(id) !== attempt || !this.nativeMesh || attempt.confirming)
 			return;
 		attempt.confirming = true;
+		const ackStarted = Date.now();
+		nativeMeshDiagnostic.record({ component: "supervisor", stage: "ack", status: "start", subject: id });
 		try {
 			await this.nativeMesh.acknowledge(id);
+			nativeMeshDiagnostic.record({ component: "supervisor",
+				stage: "ack",
+				status: "success",
+				subject: id,
+				durationMs: Date.now() - ackStarted,
+			});
 		} catch {
+			nativeMeshDiagnostic.record({ component: "supervisor",
+				stage: "ack",
+				status: "unknown",
+				subject: id,
+				durationMs: Date.now() - ackStarted,
+			});
 			/* The next poll will safely re-handoff and retry the ACK. */
 		} finally {
 			if (this.nativeAttempts.get(id) === attempt) this.nativeAttempts.delete(id);
@@ -7027,6 +7184,12 @@ export class DaemonSupervisor {
 					return;
 				const attempt = this.nativeAttempts.get(frameData.requestId);
 				if (!attempt || attempt.source !== source || attempt.token !== frameData.attemptToken) return;
+				nativeMeshDiagnostic.record({ component: "supervisor",
+					stage: "persist_frame",
+					status: outboundType === "native_mesh_message_persisted" ? "success" : "failure",
+					subject: frameData.requestId,
+					durationMs: Date.now() - attempt.started,
+				});
 				if (outboundType === "native_mesh_message_dropped") this.nativeAttempts.delete(frameData.requestId);
 				else void this.confirmNativeMeshPersisted(frameData.requestId, attempt);
 			} catch {

@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	NativeMeshRequestError,
 	NativeMeshTransport,
@@ -246,4 +246,126 @@ describe("native mesh paginated discovery", () => {
 			await expect(client.discover()).rejects.toBeInstanceOf(NativeMeshRequestError);
 		});
 	}
+});
+
+describe("native mesh discovery time budgets", () => {
+	const agents = Array.from({ length: 11 }, (_, i) => ({
+		hostId: "host",
+		agentId: `agent-${i}`,
+		id: nativeMeshAgentId("host", `agent-${i}`),
+		parentId: null,
+		name: "agent",
+		state: "active" as const,
+		status: "observed" as const,
+		lastHeartbeatAt: "2020-01-01T00:00:00.000Z",
+	})).sort((a, b) => a.id.localeCompare(b.id));
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2020-01-01T00:00:00.000Z"));
+		// Node's AbortSignal.timeout uses internal timers that fake timers do not
+		// control. Replace only its clock, while preserving abort behavior.
+		vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+			const controller = new AbortController();
+			setTimeout(() => controller.abort(), ms);
+			return controller.signal;
+		});
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.useRealTimers();
+	});
+
+	function pages(count: number, delayMs: number) {
+		return vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+			const cursor = new URL(String(input)).searchParams.get("after");
+			const index = cursor ? agents.findIndex((agent) => agent.id === cursor) + 1 : 0;
+			return new Promise<Response>((resolve, reject) => {
+				const timer = setTimeout(() => {
+					const agent = agents[index]!;
+					resolve(
+						new Response(
+							JSON.stringify({
+								version: 2,
+								agents: [agent],
+								nextCursor: index + 1 < count ? agent.id : null,
+								revision: "1",
+							}),
+						),
+					);
+				}, delayMs);
+				init?.signal?.addEventListener(
+					"abort",
+					() => {
+						clearTimeout(timer);
+						reject(new Error("aborted"));
+					},
+					{ once: true },
+				);
+			});
+		});
+	}
+
+	it("allows the default discovery scan to exceed 10 seconds across bounded pages", async () => {
+		const fetchMock = pages(2, 6_000);
+		const client = new NativeMeshTransport({ url: "http://localhost", token: "test" });
+		const result = client.discover();
+		await vi.advanceTimersByTimeAsync(12_000);
+		expect(await result).toEqual(agents.slice(0, 2));
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it("retains an explicit timeoutMs as the total discovery budget", async () => {
+		const fetchMock = pages(2, 6_000);
+		const client = new NativeMeshTransport({ url: "http://localhost", token: "test", timeoutMs: 10_000 });
+		const rejection = expect(client.discover()).rejects.toMatchObject({ operation: "discover", outcome: "unknown" });
+		await vi.advanceTimersByTimeAsync(10_000);
+		await rejection;
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it("gives discoveryTimeoutMs priority over timeoutMs in both directions", async () => {
+		const fetchMock = pages(2, 6_000);
+		const longer = new NativeMeshTransport({
+			url: "http://localhost",
+			token: "test",
+			timeoutMs: 10_000,
+			discoveryTimeoutMs: 15_000,
+		});
+		const result = longer.discover();
+		await vi.advanceTimersByTimeAsync(12_000);
+		expect(await result).toEqual(agents.slice(0, 2));
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+
+		fetchMock.mockClear();
+		const shorter = new NativeMeshTransport({
+			url: "http://localhost",
+			token: "test",
+			timeoutMs: 20_000,
+			discoveryTimeoutMs: 9_000,
+		});
+		const rejection = expect(shorter.discover()).rejects.toMatchObject({ operation: "discover", outcome: "unknown" });
+		await vi.advanceTimersByTimeAsync(9_000);
+		await rejection;
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it("bounds the default total scan at 60 seconds", async () => {
+		const fetchMock = pages(11, 6_000);
+		const client = new NativeMeshTransport({ url: "http://localhost", token: "test" });
+		const rejection = expect(client.discover()).rejects.toMatchObject({ operation: "discover", outcome: "unknown" });
+		await vi.advanceTimersByTimeAsync(60_000);
+		await rejection;
+		expect(fetchMock).toHaveBeenCalledTimes(10);
+	});
+
+	it("still aborts a single default page request at 10 seconds", async () => {
+		const fetchMock = pages(1, 20_000);
+		const client = new NativeMeshTransport({ url: "http://localhost", token: "test" });
+		const rejection = expect(client.discover()).rejects.toMatchObject({ operation: "discover", outcome: "unknown" });
+		await vi.advanceTimersByTimeAsync(9_999);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1);
+		await rejection;
+	});
 });
