@@ -763,6 +763,70 @@ describe("AgentSession action commit-fence races", () => {
 		}
 	});
 
+	it("settles delivered actions if dispatch fails while the pump epoch changes", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const internals = harness.session as unknown as CommitFenceInternals & {
+			_sessionInputPumpEpoch: number;
+			_sessionInputPump: Promise<void>;
+		};
+		const dispatchError = new Error("dispatch failed after durable delivery");
+		const originalPrompt = harness.session.agent.prompt.bind(harness.session.agent);
+		vi.spyOn(harness.session.agent, "prompt").mockImplementation(async (...args) => {
+			await originalPrompt(...args);
+			// Model a concurrent invalidation after delivery and before dispatch settles.
+			internals._sessionInputPumpEpoch++;
+			throw dispatchError;
+		});
+		expect(await harness.session.followUp("durable input", undefined, { resumeIfIdle: true })).toBe(true);
+		const action = internals._actionStore.unfinishedActions()[0];
+		if (!action) throw new Error("Expected action");
+		const ticket = internals._actionStore.ticketFor(action).ticket;
+		const completion = ticket.completed.then(
+			() => "resolved",
+			() => "rejected",
+		);
+		await internals._sessionInputPump;
+		expect(getUserTexts(harness).filter((text) => text === "durable input")).toHaveLength(1);
+		expect(internals._actionStore.unfinishedActions()).toHaveLength(0);
+		expect(await completion).toBe("rejected");
+	});
+
+	it("preserves an undelivered batch member after a durable member fails", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("retried")]);
+		harness.session.setFollowUpMode("all");
+		await harness.session.restoreFollowUpMessage("already delivered");
+		await harness.session.restoreFollowUpMessage("still pending");
+		const internals = fenceInternals(harness) as CommitFenceInternals & { _sessionInputPump: Promise<void> };
+		const [first, second] = internals._actionStore.queuedActions();
+		if (!first || !second) throw new Error("Expected two queued actions");
+		const firstTicket = internals._actionStore.ticketFor(first).ticket;
+		const secondTicket = internals._actionStore.ticketFor(second).ticket;
+		let pause: { release(): void } | undefined;
+		vi.spyOn(harness.session.agent, "prompt").mockImplementationOnce(async (messages) => {
+			const batch = Array.isArray(messages) ? messages : [messages];
+			const firstMessage = batch.find((message) => getMessageText(message) === "already delivered");
+			if (!firstMessage) throw new Error("Expected first message");
+			harness.session.agent.state.messages.push(firstMessage);
+			pause = harness.session.acquireQueuedWorkPause();
+			throw new Error("partial dispatch failed");
+		});
+		harness.session.resumeQueuedWork();
+		await internals._sessionInputPump;
+		await expect(firstTicket.delivered).resolves.toEqual({ status: "delivered" });
+		await expect(firstTicket.completed).rejects.toThrow("partial dispatch failed");
+		expect(internals._actionStore.unfinishedActions()).toEqual([second]);
+		expect(second.lifecycle.state).toBe("queued");
+		pause?.release();
+		await secondTicket.completed;
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness).filter((text) => text === "already delivered")).toHaveLength(1);
+		expect(getUserTexts(harness).filter((text) => text === "still pending")).toHaveLength(1);
+	});
+
 	it.each([
 		...["turn", "command"].flatMap((kind) =>
 			(["pause", "clear", "restart", "dispose"] as const).map((interruption) => ({

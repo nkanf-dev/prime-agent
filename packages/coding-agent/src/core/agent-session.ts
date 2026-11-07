@@ -7350,6 +7350,25 @@ export class AgentSession {
 						if (!primaryDeliveryRecord(action).durable) undelivered.push(action);
 					}
 					if (this._isDeferredSessionInputError(error, epoch)) {
+						// A dispatch can fail after one or more primary messages became durable.
+						// Only undelivered actions may be retried. Settle delivered actions as
+						// failed so they are not stranded outside the pump or delivered twice.
+						const dispatchError = this._asError(error);
+						for (const action of actions) {
+							if (action.payload.kind !== "turn" || !primaryDeliveryRecord(action).durable) continue;
+							if (
+								action.lifecycle.state === "completed" ||
+								action.lifecycle.state === "failed" ||
+								action.lifecycle.state === "cancelled"
+							)
+								continue;
+							transitionSessionAction(action, { state: "failed", error: dispatchError });
+							const ticket = this._actionStore.ticketFor(action);
+							ticket.settleDelivered({ status: "delivered" });
+							ticket.settleCompleted(dispatchError);
+							this._settleAgentMessage(action.agentMessageId, "delivery");
+							this._settleAgentMessage(action.agentMessageId, "completion", dispatchError);
+						}
 						for (const action of undelivered) {
 							if (action.lifecycle.state === "committing") {
 								this._actionStore.rollback(action, {
