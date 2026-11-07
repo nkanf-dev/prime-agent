@@ -57,8 +57,8 @@ import {
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	createAgentMessageHostHandlers,
-	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	formatAgentSessionNameUnavailable,
+	getAgentMessageMaxPendingPerSession,
 	isAgentSessionMessage,
 	isAgentSessionMessageId,
 	isAgentSessionMessagePrompt,
@@ -1682,6 +1682,7 @@ export class AgentSession {
 				routedOverride?: AgentModelOverride;
 		  }
 		| undefined = undefined;
+	private readonly _agentMessageMaxPendingPerSession: number;
 	private _agentMessageClearEpoch = 0;
 	private readonly _replacingAgentMessageIds = new Set<string>();
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
@@ -1835,6 +1836,7 @@ export class AgentSession {
 	};
 
 	constructor(config: AgentSessionConfig) {
+		this._agentMessageMaxPendingPerSession = getAgentMessageMaxPendingPerSession();
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
@@ -7120,10 +7122,7 @@ export class AgentSession {
 				for (const id of incomingAgentMessageIds) pendingAgentMessageIds.add(id);
 				if (pendingAgentMessageIds.size > previousCount) {
 					// The helper tests whether one more message fits; apply it to the final addition.
-					assertAgentMessageQueueCapacity(
-						pendingAgentMessageIds.size - 1,
-						DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-					);
+					assertAgentMessageQueueCapacity(pendingAgentMessageIds.size - 1, this._agentMessageMaxPendingPerSession);
 				}
 			}
 		}

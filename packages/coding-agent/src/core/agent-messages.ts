@@ -20,6 +20,27 @@ export const DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION = 20;
 export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY = 3;
 export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS = 1000;
 
+const AGENT_MESSAGE_MAX_PENDING_ENV = "PRIME_AGENT_MESSAGE_MAX_PENDING_PER_SESSION";
+let agentMessageMaxPendingPerSession: number | undefined;
+
+/** Resolve once per process so every session and the worker status use the same limit. */
+export function getAgentMessageMaxPendingPerSession(): number {
+	if (agentMessageMaxPendingPerSession !== undefined) return agentMessageMaxPendingPerSession;
+	const raw = process.env[AGENT_MESSAGE_MAX_PENDING_ENV];
+	if (raw === undefined) {
+		agentMessageMaxPendingPerSession = DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION;
+	} else {
+		const parsed = Number(raw);
+		if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+			throw new Error(
+				`${AGENT_MESSAGE_MAX_PENDING_ENV} must be a positive integer up to ${Number.MAX_SAFE_INTEGER}.`,
+			);
+		}
+		agentMessageMaxPendingPerSession = parsed;
+	}
+	return agentMessageMaxPendingPerSession;
+}
+
 /** Legacy daemon wire input accepted and ignored for compatibility. */
 export type AgentSessionMessageDeliveryMode = "auto" | "steer" | "follow_up";
 export type AgentSessionMessageDeliveryStatus = "delivered" | "queued" | "stored";

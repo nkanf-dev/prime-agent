@@ -49,10 +49,10 @@ import {
 	createAgentSessionMessageId,
 	createAgentSessionMessageReceipt,
 	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
-	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
 	formatAgentSessionNameUnavailable,
+	getAgentMessageMaxPendingPerSession,
 	normalizeAgentSessionMessage,
 	selectAgentFamily,
 	sessionNameReservationKey,
@@ -162,7 +162,6 @@ import {
 	workerRosterEntryFromSummary,
 } from "./agent-roster.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
-import { recordNativeMeshDiagnostic } from "./native-mesh/diagnostic.js";
 import { DaemonAutoReloadScheduler } from "./daemon-auto-reload.js";
 import { DaemonCapabilityUnavailableError } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
@@ -248,6 +247,7 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import { recordNativeMeshDiagnostic } from "./native-mesh/diagnostic.js";
 import {
 	createRlmLedgerRegistrySeedSource,
 	type LegacyRlmSubagentRegistryEntry,
@@ -6309,7 +6309,7 @@ export class AgentDaemon {
 		return {
 			paused: this.agentMessagesPaused,
 			maxMessageChars: DEFAULT_AGENT_MESSAGE_MAX_CHARS,
-			maxPendingPerSession: DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+			maxPendingPerSession: getAgentMessageMaxPendingPerSession(),
 			rateLimitCapacity: DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY,
 			rateLimitRefillMs: DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
 		};
