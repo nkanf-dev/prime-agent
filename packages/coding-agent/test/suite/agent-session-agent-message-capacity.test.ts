@@ -1,5 +1,5 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AGENT_MESSAGE_SOURCE,
 	createAgentSessionMessage,
@@ -208,12 +208,58 @@ describe("agent-message unfinished capacity", () => {
 	});
 
 	it.each(["prompt", "injected"] as const)(
-		"restores pending next-turn context after a rejected %s admission",
+		"transfers restored parked prefixes to a visible queued %s without re-admitting them",
+		async (path) => {
+			for (const count of [20, 21, 25]) {
+				const harness = await createHarness();
+				harnesses.push(harness);
+				const pause = harness.session.acquireQueuedWorkPause();
+				const ordinary: CustomMessage = {
+					role: "custom",
+					customType: "context",
+					content: "context",
+					display: false,
+					timestamp: 1,
+				};
+				const pending = [
+					ordinary,
+					...Array.from({ length: count }, (_, i) => agentPrefix(harness, i)),
+					agentPrefix(harness, 0),
+				];
+				harness.session.restorePendingNextTurnMessages(pending);
+				await expect(queueAgent(harness, count)).rejects.toThrow(capacityError);
+				withStreaming(harness, true);
+				pause.release();
+				if (path === "prompt") {
+					await harness.session.prompt("human input", { streamingBehavior: "followUp" });
+				} else {
+					await (harness.session as unknown as AdmissionInternals)._promptInjectedMessage("injected", ordinary, {
+						streamingBehavior: "followUp",
+						returnAfterAccepted: true,
+					});
+				}
+				expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual([]);
+				const actions = harness.session.getSessionActionRecoverySnapshot().actions;
+				expect(actions).toHaveLength(1);
+				const payload = actions[0]!.payload;
+				if (payload.kind !== "turn") throw new Error("missing turn");
+				expect(
+					payload.records.filter((record) => record.role === "prefix").map((record) => record.message),
+				).toEqual(pending);
+				await expect(queueAgent(harness, count)).rejects.toThrow(capacityError);
+				withStreaming(harness, false);
+				harness.session.dispose();
+				pause.release();
+			}
+		},
+	);
+
+	it.each(["prompt", "injected"] as const)(
+		"rejects a new 21st agent on %s admission and restores parked prefixes in order",
 		async (path) => {
 			const harness = await createHarness();
 			harnesses.push(harness);
 			const pause = harness.session.acquireQueuedWorkPause();
-			for (let i = 0; i < 20; i++) await queueAgent(harness, i);
 			const ordinary: CustomMessage = {
 				role: "custom",
 				customType: "context",
@@ -221,21 +267,164 @@ describe("agent-message unfinished capacity", () => {
 				display: false,
 				timestamp: 1,
 			};
-			const pending = [ordinary, agentPrefix(harness, 20), agentPrefix(harness, 21)];
+			const pending = [
+				ordinary,
+				...Array.from({ length: 20 }, (_, i) => agentPrefix(harness, i)),
+				agentPrefix(harness, 0),
+				ordinary,
+			];
 			harness.session.restorePendingNextTurnMessages(pending);
 			const before = harness.session.getSessionActionRecoverySnapshot();
 			withStreaming(harness, true);
 			pause.release();
+			const newAgent = agentPrefix(harness, 20);
 			const call =
 				path === "prompt"
-					? harness.session.prompt("human input", { streamingBehavior: "followUp" })
-					: (harness.session as unknown as AdmissionInternals)._promptInjectedMessage("injected", ordinary, {
+					? harness.session.acceptAgentMessagePrompt("new agent", {
+							streamingBehavior: "followUp",
+							customMessage: newAgent,
+						})
+					: (harness.session as unknown as AdmissionInternals)._promptInjectedMessage("new agent", newAgent, {
 							streamingBehavior: "followUp",
 							returnAfterAccepted: true,
 						});
 			await expect(call).rejects.toThrow(capacityError);
 			expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual(pending);
 			expect(harness.session.getSessionActionRecoverySnapshot()).toEqual(before);
+			withStreaming(harness, false);
+			harness.session.dispose();
+			pause.release();
+		},
+	);
+
+	it.each(["prompt", "injected"] as const)(
+		"restores parked prefixes once on a pre-enqueue %s exception",
+		async (path) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const pending = [agentPrefix(harness, 0), agentPrefix(harness, 1), agentPrefix(harness, 0)];
+			harness.session.restorePendingNextTurnMessages(pending);
+			withStreaming(harness, true);
+			const internals = harness.session as unknown as AdmissionInternals;
+			const spy = vi.spyOn(internals, "_admitSessionInput").mockImplementation(() => {
+				throw new Error("before enqueue");
+			});
+			const ordinary: CustomMessage = {
+				role: "custom",
+				customType: "context",
+				content: "context",
+				display: false,
+				timestamp: 1,
+			};
+			try {
+				const call =
+					path === "prompt"
+						? harness.session.prompt("human input", { streamingBehavior: "followUp" })
+						: internals._promptInjectedMessage("injected", ordinary, {
+								streamingBehavior: "followUp",
+								returnAfterAccepted: true,
+							});
+				await expect(call).rejects.toThrow("before enqueue");
+				expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual(pending);
+				expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
+			} finally {
+				spy.mockRestore();
+				withStreaming(harness, false);
+				harness.session.dispose();
+			}
+		},
+	);
+
+	it.each(["prompt", "injected"] as const)(
+		"does not restore parked prefixes twice when %s enqueue is cancelled by a listener and emission throws",
+		async (path) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const pending = [agentPrefix(harness, 0), agentPrefix(harness, 1), agentPrefix(harness, 0)];
+			harness.session.restorePendingNextTurnMessages(pending);
+			withStreaming(harness, true);
+			let mutation: string | undefined;
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "session_action_update" || event.actions.followUps.length === 0) return;
+				const text = event.actions.followUps[0]!;
+				mutation = harness.session.mutateQueuedMessage("followUp", 0, text, { type: "delete" });
+			});
+			const internals = harness.session as unknown as AdmissionInternals & { _emitQueueUpdate(): void };
+			const originalEmit = internals._emitQueueUpdate.bind(harness.session);
+			let first = true;
+			const spy = vi.spyOn(internals, "_emitQueueUpdate").mockImplementation(() => {
+				const shouldThrow = first;
+				first = false;
+				originalEmit();
+				if (shouldThrow) throw new Error("after enqueue");
+			});
+			const ordinary: CustomMessage = {
+				role: "custom",
+				customType: "context",
+				content: "context",
+				display: false,
+				timestamp: 1,
+			};
+			try {
+				const call =
+					path === "prompt"
+						? harness.session.prompt("human input", { streamingBehavior: "followUp" })
+						: internals._promptInjectedMessage("injected", ordinary, {
+								streamingBehavior: "followUp",
+								returnAfterAccepted: true,
+							});
+				await expect(call).rejects.toThrow("after enqueue");
+				expect(mutation).toBe("applied");
+				expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual(pending);
+				expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
+			} finally {
+				spy.mockRestore();
+				unsubscribe();
+				withStreaming(harness, false);
+				harness.session.dispose();
+			}
+		},
+	);
+
+	it.each(["prompt", "injected"] as const)(
+		"concurrent %s transfers and new agents retain each parked prefix and enforce capacity",
+		async (path) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const pause = harness.session.acquireQueuedWorkPause();
+			const pending = Array.from({ length: 19 }, (_, i) => agentPrefix(harness, i));
+			harness.session.restorePendingNextTurnMessages(pending);
+			const ordinary: CustomMessage = {
+				role: "custom",
+				customType: "context",
+				content: "context",
+				display: false,
+				timestamp: 1,
+			};
+			withStreaming(harness, true);
+			pause.release();
+			const transfer =
+				path === "prompt"
+					? harness.session.prompt("human input", { streamingBehavior: "followUp" })
+					: (harness.session as unknown as AdmissionInternals)._promptInjectedMessage("injected", ordinary, {
+							streamingBehavior: "followUp",
+							returnAfterAccepted: true,
+						});
+			const [transferResult, ...agents] = await Promise.allSettled([
+				transfer,
+				...[19, 20, 21].map((i) => queueAgent(harness, i)),
+			]);
+			expect(transferResult.status).toBe("fulfilled");
+			expect(agents.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+			expect(agents.filter((result) => result.status === "rejected")).toHaveLength(2);
+			expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual([]);
+			const actions = harness.session.getSessionActionRecoverySnapshot().actions;
+			const prefixes = actions.flatMap((action) =>
+				action.payload.kind === "turn"
+					? action.payload.records.filter((record) => record.role === "prefix").map((record) => record.message)
+					: [],
+			);
+			expect(prefixes).toEqual(pending);
 			withStreaming(harness, false);
 			harness.session.dispose();
 			pause.release();
@@ -287,6 +476,31 @@ describe("agent-message unfinished capacity", () => {
 		await expect(queueAgent(restored, 41)).resolves.toBe(true);
 		restored.session.dispose();
 		pause.release();
+	});
+
+	it("preserves parked context when preparation is aborted after concurrent admissions", async () => {
+		const hook = gatedHook();
+		const harness = await createHarness({ extensionFactories: [hook.factory] });
+		harnesses.push(harness);
+		const pending = Array.from({ length: 2 }, (_, i) => agentPrefix(harness, i));
+		harness.session.restorePendingNextTurnMessages(pending);
+		const running = harness.session.prompt("prepare");
+		await hook.reached;
+		expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual([]);
+		// Context is in the asynchronous preparation local, not yet in the action store.
+		// Check preservation on abort; strict counting of that in-flight context is a separate gap.
+		for (let i = 2; i < 19; i++) await queueAgent(harness, i);
+		const internals = harness.session as unknown as AdmissionInternals;
+		const oversized = internals._createPreparedTurnAction("followUp", "oversized", undefined, {
+			prefixMessages: [19, 20, 21, 22].map((i) => agentPrefix(harness, i)),
+		});
+		expect(() => internals._admitSessionInput(oversized, { wake: false })).toThrow(capacityError);
+		const aborted = harness.session.abort();
+		hook.release();
+		await aborted;
+		await Promise.allSettled([running]);
+		expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual(pending);
+		harness.session.dispose();
 	});
 
 	it("counts an agent action while its model turn is active", async () => {

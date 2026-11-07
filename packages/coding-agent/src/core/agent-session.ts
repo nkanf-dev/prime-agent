@@ -47,7 +47,6 @@ import {
 	AGENT_MESSAGE_SKILL_NAME,
 	type AgentFamilyCatalogEntry,
 	AgentMessageClearedError,
-	AgentMessageQueueCapacityError,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
@@ -6236,34 +6235,41 @@ export class AgentSession {
 			}
 			const schedule = options?.streamingBehavior ?? "followUp";
 			const prefixMessages = visibleQueued ? this._takePendingNextTurnMessages() : undefined;
-			const action = this._createPreparedTurnAction(schedule, text, undefined, {
-				message,
-				prefixMessages,
-				queueKey: options?.followUpQueueKey,
-				previewLabel: injectedMessagePreviewLabel(message),
-				suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
-				resumeIfIdle:
-					!visibleQueued ||
-					options?.resumeIfIdle ||
-					(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
-				source: options?.source ?? "internal",
-				priority: options?.priority,
-				executionPolicy:
-					options?.executionPolicy ??
-					(visibleQueued ? this._turnExecutionPolicy("queued") : this._turnExecutionPolicy("injected")),
-				queueVisible: visibleQueued,
-			});
+			let action: QueuedSessionAction | undefined;
+			let prefixTransferred = false;
 			let result: ReturnType<AgentSession["_admitSessionInput"]>;
 			try {
+				action = this._createPreparedTurnAction(schedule, text, undefined, {
+					message,
+					prefixMessages,
+					queueKey: options?.followUpQueueKey,
+					previewLabel: injectedMessagePreviewLabel(message),
+					suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
+					resumeIfIdle:
+						!visibleQueued ||
+						options?.resumeIfIdle ||
+						(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
+					source: options?.source ?? "internal",
+					priority: options?.priority,
+					executionPolicy:
+						options?.executionPolicy ??
+						(visibleQueued ? this._turnExecutionPolicy("queued") : this._turnExecutionPolicy("injected")),
+					queueVisible: visibleQueued,
+				});
 				result = this._admitSessionInput(action, {
+					existingPrefixMessages: prefixMessages,
+					onEnqueued: () => {
+						prefixTransferred = true;
+					},
 					immediatelyEligible: !visibleQueued,
 				});
 			} catch (error) {
-				if (error instanceof AgentMessageQueueCapacityError && prefixMessages) {
+				if (prefixMessages && !prefixTransferred) {
 					this._pendingNextTurnMessages.unshift(...prefixMessages);
 				}
 				throw error;
 			}
+			if (!action) throw new Error("Session action was not created.");
 			admissionFence.release();
 			if (!result.accepted || !result.ticket) {
 				if (prefixMessages) this._pendingNextTurnMessages.unshift(...prefixMessages);
@@ -6401,7 +6407,6 @@ export class AgentSession {
 					);
 				}
 				const schedule = options?.streamingBehavior ?? "followUp";
-				const prefixMessages = visibleQueued ? this._takePendingNextTurnMessages() : undefined;
 				const content = options?.content
 					? options.content.map((block) => ({ ...block }))
 					: this._buildPromptContent(normalized.text, normalized.images);
@@ -6416,44 +6421,52 @@ export class AgentSession {
 							timestamp: Date.now(),
 						} satisfies UserMessage);
 				const acceptedAgentMessage = options?.skipPrePromptWork === true && options.returnAfterAccepted === true;
-				const action = this._createPreparedTurnAction(schedule, normalized.text, normalized.images, {
-					agentMessageId: options?.agentMessageId,
-					queueKey: options?.followUpQueueKey,
-					content,
-					message: primaryMessage,
-					prefixMessages,
-					suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
-					resumeIfIdle:
-						!visibleQueued ||
-						options?.resumeIfIdle ||
-						(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
-					source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
-					inputId: normalized.inputId,
-					priority: options?.priority,
-					executionPolicy: visibleQueued
-						? this._turnExecutionPolicy("queued")
-						: this._turnExecutionPolicy("directPrompt", {
-								returnAfterAccepted: options?.returnAfterAccepted,
-								skipPrePromptWork: options?.skipPrePromptWork,
-							}),
-					queueVisible: visibleQueued,
-					acceptedAgentMessage,
-					acceptedBeforeCompletion: options?.returnAfterAccepted === true,
-				});
-				if (action.suppressAutonomousContinuation) {
-					this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
-				}
+				const prefixMessages = visibleQueued ? this._takePendingNextTurnMessages() : undefined;
+				let action: QueuedSessionAction | undefined;
+				let prefixTransferred = false;
 				let result: ReturnType<AgentSession["_admitSessionInput"]>;
 				try {
+					action = this._createPreparedTurnAction(schedule, normalized.text, normalized.images, {
+						agentMessageId: options?.agentMessageId,
+						queueKey: options?.followUpQueueKey,
+						content,
+						message: primaryMessage,
+						prefixMessages,
+						suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
+						resumeIfIdle:
+							!visibleQueued ||
+							options?.resumeIfIdle ||
+							(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
+						source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
+						inputId: normalized.inputId,
+						priority: options?.priority,
+						executionPolicy: visibleQueued
+							? this._turnExecutionPolicy("queued")
+							: this._turnExecutionPolicy("directPrompt", {
+									returnAfterAccepted: options?.returnAfterAccepted,
+									skipPrePromptWork: options?.skipPrePromptWork,
+								}),
+						queueVisible: visibleQueued,
+						acceptedAgentMessage,
+						acceptedBeforeCompletion: options?.returnAfterAccepted === true,
+					});
+					if (action.suppressAutonomousContinuation) {
+						this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
+					}
 					result = this._admitSessionInput(action, {
+						existingPrefixMessages: prefixMessages,
+						onEnqueued: () => {
+							prefixTransferred = true;
+						},
 						immediatelyEligible: !visibleQueued && this._canStartSessionActionImmediately(),
 					});
 				} catch (error) {
-					if (error instanceof AgentMessageQueueCapacityError && prefixMessages) {
+					if (prefixMessages && !prefixTransferred) {
 						this._pendingNextTurnMessages.unshift(...prefixMessages);
 					}
 					throw error;
 				}
+				if (!action) throw new Error("Session action was not created.");
 				commitFence?.release();
 				if (!result.accepted || !result.ticket) {
 					if (prefixMessages) this._pendingNextTurnMessages.unshift(...prefixMessages);
@@ -7066,6 +7079,9 @@ export class AgentSession {
 			preserveOrder?: boolean;
 			wake?: boolean;
 			immediatelyEligible?: boolean;
+			// Prefix removed from the parked queue in this synchronous admission.
+			existingPrefixMessages?: readonly CustomMessage[];
+			onEnqueued?: () => void;
 		} = {},
 	): {
 		accepted: boolean;
@@ -7086,8 +7102,14 @@ export class AgentSession {
 				if (isAgentSessionMessage(record.message)) incomingAgentMessageIds.add(record.message.details.id);
 			}
 			if (incomingAgentMessageIds.size > 0) {
-				// Count unique agent messages across unfinished and incoming records, including prefixes.
+				// A parked prefix is already owned, even while it is being moved into this action.
 				const pendingAgentMessageIds = new Set<string>();
+				for (const message of this._pendingNextTurnMessages) {
+					if (isAgentSessionMessage(message)) pendingAgentMessageIds.add(message.details.id);
+				}
+				for (const message of options.existingPrefixMessages ?? []) {
+					if (isAgentSessionMessage(message)) pendingAgentMessageIds.add(message.details.id);
+				}
 				for (const candidate of this._actionStore.unfinishedActions()) {
 					if (candidate.payload.kind !== "turn") continue;
 					for (const record of candidate.payload.records) {
@@ -7124,6 +7146,7 @@ export class AgentSession {
 				? "tail"
 				: "priority";
 		this._actionStore.enqueue(action, placement);
+		options.onEnqueued?.();
 		let disposition: "starts_when_admitted" | "queued" = "queued";
 		if (canStartImmediately && this._actionStore.selectFirst() === action) disposition = "starts_when_admitted";
 		const controller = this._actionStore.ticketFor(action);
