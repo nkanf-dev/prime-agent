@@ -200,6 +200,7 @@ import {
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import { type NativeMeshConfig, nativeMeshConfigFromEnvironment } from "./native-mesh/config.js";
 import { nativeMeshDiagnostic } from "./native-mesh/diagnostic.js";
+import { type NativeMeshEndpoint, NativeMeshEndpoints } from "./native-mesh/endpoints.js";
 import { NativeMeshOperations } from "./native-mesh/operations.js";
 import { NativeMeshOutbox } from "./native-mesh/outbox.js";
 import { type NativeMeshObservation, NativeMeshTransport, nativeMeshAgentId } from "./native-mesh/transport.js";
@@ -362,6 +363,7 @@ interface NativeMeshPassiveEndpoint {
 	summary: SessionSummary;
 	rootPath: string;
 	rootSessionId: string;
+	binding: NativeMeshEndpoint;
 }
 
 interface SnapshotDuplicateValidation {
@@ -802,6 +804,9 @@ export class DaemonSupervisor {
 	private nativeMesh?: NativeMeshTransport;
 	private nativeOutbox?: NativeMeshOutbox;
 	private nativeOperations?: NativeMeshOperations;
+	private nativeEndpoints?: NativeMeshEndpoints;
+	private nativeMeshCursor?: string;
+	private nativeMeshCapacityWarning = false;
 	private nativeMeshTimer?: ReturnType<typeof setInterval>;
 	private nativeMeshSweep?: Promise<void>;
 	private nativeMeshRecoveryFailed = false;
@@ -930,6 +935,12 @@ export class DaemonSupervisor {
 				).toString("base64url");
 				this.nativeMesh = new NativeMeshTransport({ ...this.nativeMeshConfig, registration });
 				this.nativeOperations = new NativeMeshOperations(join(this.descriptorDir, "native-mesh-operations"));
+				try {
+					this.nativeEndpoints = new NativeMeshEndpoints(join(this.descriptorDir, "native-mesh-endpoints"));
+				} catch {
+					// A damaged registry disables passive wake, not delivery to resident sessions.
+					this.log("Native mesh endpoint registry could not be loaded; passive delivery unavailable");
+				}
 				this.nativeOutbox = new NativeMeshOutbox(
 					join(this.descriptorDir, "native-mesh-outbox"),
 					this.nativeMesh,
@@ -4417,97 +4428,109 @@ export class DaemonSupervisor {
 		return qualified;
 	}
 
-	/** Saved roots and ledger children remain addressable even without a resident worker. */
+	/** Only identities previously bound after a successful registration can become passive. */
 	private async nativePassiveEndpoints(): Promise<NativeMeshPassiveEndpoint[]> {
 		const config = this.nativeMeshConfig;
-		if (!config) return [];
-		const [saved, edges] = await Promise.all([
-			this.catalog.list(undefined, this.defaultSessionConfig.sessionDir),
-			this.rlmSpawnLedger().liveEdges(),
-		]);
-		const byPath = new Map<string, SessionInfo>();
-		for (const info of saved) byPath.set(canonicalSessionPath(info.path), info);
-		// The catalog normally lists roots. The ledger owns subagent topology.
-		for (const edge of edges) {
-			for (const path of [edge.parent, edge.child]) {
-				const key = canonicalSessionPath(path);
-				if (byPath.has(key)) continue;
-				const info = await readSessionInfo(path).catch(() => null);
-				if (info) byPath.set(key, info);
-			}
-		}
-		const parents = new Map<string, string>();
-		const ambiguous = new Set<string>();
-		for (const edge of edges) {
-			const child = canonicalSessionPath(edge.child);
-			const parent = canonicalSessionPath(edge.parent);
-			if (parents.has(child) && parents.get(child) !== parent) ambiguous.add(child);
-			parents.set(child, parent);
-		}
-		const counts = new Map<string, number>();
-		for (const info of byPath.values()) counts.set(info.id, (counts.get(info.id) ?? 0) + 1);
+		if (!config || !this.nativeEndpoints) return [];
 		const occupied = new Set<string>();
 		for (const entry of this.roster().values()) {
 			if (entry.workerId && this.workers.has(entry.workerId)) {
 				const summary = sessionSummaryFromRosterEntry(entry);
-				if (summary.sessionId) occupied.add(summary.sessionId);
+				if (summary.sessionId && summary.activeSessionId) occupied.add(summary.sessionId);
 			}
 		}
-		const result: NativeMeshPassiveEndpoint[] = [];
-		for (const [path, info] of byPath) {
-			if (!info.id || counts.get(info.id) !== 1 || occupied.has(info.id)) continue;
-			let current = path;
-			const seen = new Set<string>();
-			let valid = true;
-			while (parents.has(current)) {
-				if (seen.has(current) || ambiguous.has(current)) {
-					valid = false;
-					break;
-				}
-				seen.add(current);
-				current = parents.get(current)!;
-				if (!byPath.has(current)) {
-					valid = false;
-					break;
-				}
-			}
-			const root = byPath.get(current);
-			if (!valid || !root || counts.get(root.id) !== 1) continue;
-			// A child with no ledger chain cannot safely be treated as a root.
-			if (!parents.has(path) && info.rlmDepth > 0) continue;
-			const parent = parents.has(path) ? byPath.get(parents.get(path)!) : undefined;
-			if (parent && counts.get(parent.id) !== 1) continue;
-			try {
-				result.push({
-					id: nativeMeshAgentId(config.machineId, info.id),
-					parentId: parent ? nativeMeshAgentId(config.machineId, parent.id) : null,
-					summary: summaryForInactiveSession(info),
-					rootPath: root.path,
-					rootSessionId: root.id,
-				});
-			} catch {
-				/* Invalid identity cannot be addressed. */
-			}
+		return this.nativeEndpoints
+			.list(config.machineId)
+			.filter((item) => !occupied.has(item.sessionId))
+			.map((item) => {
+				const parent = item.ancestors[0];
+				const summary: SessionSummary = {
+					id: item.sessionId,
+					sessionId: item.sessionId,
+					sessionFile: item.sessionPath,
+					sessionName: item.name,
+					cwd: item.cwd,
+					rlmDepth: item.rlmDepth,
+					lifecycle: "live",
+					activity: "idle",
+					isSessionActive: false,
+					isStreaming: false,
+					isCompacting: false,
+					attachedClients: 0,
+					messageCount: 0,
+					unfinishedActionCount: 0,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+					...(parent ? { parentSessionId: parent.sessionId, parentSessionPath: parent.sessionPath } : {}),
+				};
+				return {
+					id: nativeMeshAgentId(config.machineId, item.sessionId),
+					parentId: parent ? nativeMeshAgentId(config.machineId, parent.sessionId) : null,
+					summary,
+					rootPath: item.rootPath,
+					rootSessionId: item.rootSessionId,
+					binding: item,
+				};
+			});
+	}
+
+	/** Capture a precise live chain, never a display name or a catalog search. */
+	private nativeEndpointBinding(
+		endpoint: ReturnType<DaemonSupervisor["nativeLocalEndpoints"]>[number],
+	): NativeMeshEndpoint | undefined {
+		const machineId = this.nativeMeshConfig?.machineId;
+		if (!machineId || !endpoint.summary.sessionFile) return undefined;
+		const rows = [...this.roster().values()].map(sessionSummaryFromRosterEntry);
+		let summary = endpoint.summary;
+		const ancestors: NativeMeshEndpoint["ancestors"] = [];
+		const seen = new Set([summary.sessionId]);
+		while (summary.parentSessionId) {
+			const matches = rows.filter((row) => row.sessionId === summary.parentSessionId && row.sessionFile);
+			if (matches.length !== 1 || seen.has(matches[0]!.sessionId)) return undefined;
+			summary = matches[0]!;
+			seen.add(summary.sessionId);
+			ancestors.push({ sessionId: summary.sessionId, sessionPath: summary.sessionFile! });
 		}
-		return result;
+		if ((endpoint.summary.rlmDepth ?? 0) !== ancestors.length || (summary.rlmDepth ?? 0) !== 0) return undefined;
+		return {
+			machineId,
+			sessionId: endpoint.summary.sessionId,
+			sessionPath: endpoint.summary.sessionFile,
+			rootPath: summary.sessionFile!,
+			rootSessionId: summary.sessionId,
+			ancestors,
+			name: endpoint.summary.sessionName ?? endpoint.summary.sessionId,
+			cwd: endpoint.summary.cwd,
+			rlmDepth: ancestors.length,
+		};
 	}
 
 	/** Revalidate the exact saved identity before starting or reusing the root worker. */
 	private async wakeNativeMeshEndpoint(endpoint: NativeMeshPassiveEndpoint): Promise<WorkerMatch> {
-		const current = (await this.nativePassiveEndpoints()).find((item) => item.id === endpoint.id);
+		const binding = endpoint.binding;
+		const current = this.nativeEndpoints?.read(binding.machineId, binding.sessionId);
 		if (
 			!current ||
-			current.summary.sessionId !== endpoint.summary.sessionId ||
-			canonicalSessionPath(current.summary.sessionFile!) !== canonicalSessionPath(endpoint.summary.sessionFile!) ||
-			canonicalSessionPath(current.rootPath) !== canonicalSessionPath(endpoint.rootPath) ||
-			current.rootSessionId !== endpoint.rootSessionId ||
-			current.parentId !== endpoint.parentId
+			current.sessionPath !== binding.sessionPath ||
+			current.rootPath !== binding.rootPath ||
+			current.rootSessionId !== binding.rootSessionId ||
+			JSON.stringify(current.ancestors) !== JSON.stringify(binding.ancestors)
 		)
 			throw new Error("Native mesh saved target changed");
-		const target = await readSessionInfo(endpoint.summary.sessionFile!);
-		const root = await readSessionInfo(endpoint.rootPath);
-		if (!target || target.id !== endpoint.summary.sessionId || !root || root.id !== endpoint.rootSessionId)
-			throw new Error("Native mesh saved target identity changed");
+		const chain = [{ sessionId: binding.sessionId, sessionPath: binding.sessionPath }, ...binding.ancestors];
+		for (const item of chain) {
+			const info = await readSessionInfo(item.sessionPath);
+			if (!info || info.id !== item.sessionId) throw new Error("Native mesh saved target identity changed");
+		}
+		if (binding.ancestors.length) {
+			const edges = await this.rlmSpawnLedger().liveEdges();
+			for (let i = 0; i < chain.length - 1; i++) {
+				const child = canonicalSessionPath(chain[i]!.sessionPath);
+				const parent = canonicalSessionPath(chain[i + 1]!.sessionPath);
+				const matching = edges.filter((edge) => canonicalSessionPath(edge.child) === child);
+				if (matching.length !== 1 || canonicalSessionPath(matching[0]!.parent) !== parent)
+					throw new Error("Native mesh saved parent chain changed");
+			}
+		}
 		if (!this.findWorkerBySessionFile(endpoint.rootPath)) {
 			const live = findLiveSessionCopy(endpoint.rootPath, this.defaultSessionConfig.agentDir!, (path) =>
 				this.log(`Native message ownership check skipped unreadable lease: ${path}`),
@@ -4615,6 +4638,25 @@ export class DaemonSupervisor {
 		for (const [id, attempt] of this.nativeAttempts) {
 			if (!attempt.confirming && Date.now() - attempt.started > 120_000) this.nativeAttempts.delete(id);
 		}
+		if (this.nativeEndpoints) {
+			const paths = new Map<string, string>();
+			for (const entry of this.roster().values()) {
+				if (!entry.workerId || !this.workers.has(entry.workerId)) continue;
+				const summary = sessionSummaryFromRosterEntry(entry);
+				if (!summary.sessionId || !summary.sessionFile || !summary.activeSessionId) continue;
+				const path = canonicalSessionPath(summary.sessionFile);
+				const previous = paths.get(summary.sessionId);
+				if (previous && previous !== path) {
+					try {
+						this.nativeEndpoints.quarantine(config.machineId, summary.sessionId);
+					} catch {
+						this.nativeEndpoints = undefined;
+						this.log("Native mesh endpoint registry could not quarantine an ambiguous identity");
+						break;
+					}
+				} else paths.set(summary.sessionId, path);
+			}
+		}
 		let passive: NativeMeshPassiveEndpoint[] = [];
 		try {
 			passive = await this.nativePassiveEndpoints();
@@ -4622,7 +4664,21 @@ export class DaemonSupervisor {
 			// A catalog failure must not stop delivery to resident sessions.
 			this.log("Native mesh saved-session scan failed; retrying");
 		}
-		const endpoints = [...this.nativeLocalEndpoints(), ...passive];
+		const allEndpoints = [...this.nativeLocalEndpoints(), ...passive].sort((a, b) => a.id.localeCompare(b.id));
+		// Bound network work and rotate from the last id, even when sessions are added or removed.
+		const capacityExceeded = allEndpoints.length > 64 * 18;
+		if (capacityExceeded && !this.nativeMeshCapacityWarning)
+			this.log(
+				`Native mesh has ${allEndpoints.length} endpoints; its 64-per-sweep budget cannot refresh all within 90 seconds`,
+			);
+		this.nativeMeshCapacityWarning = capacityExceeded;
+		let start = this.nativeMeshCursor ? allEndpoints.findIndex((item) => item.id > this.nativeMeshCursor!) : 0;
+		if (start < 0) start = 0;
+		const endpoints = Array.from(
+			{ length: Math.min(64, allEndpoints.length) },
+			(_, index) => allEndpoints[(start + index) % allEndpoints.length]!,
+		);
+		if (endpoints.length) this.nativeMeshCursor = endpoints[endpoints.length - 1]!.id;
 		const registered = await Promise.allSettled(
 			endpoints.map(async (endpoint) => {
 				const rawPrefix = process.env.PRIME_AGENT_TEAM_DISPLAY_PREFIX?.trim() || config.machineId || hostname();
@@ -4634,7 +4690,12 @@ export class DaemonSupervisor {
 						? displayName
 						: endpoint.id;
 				const started = Date.now();
-				nativeMeshDiagnostic.record({ component: "supervisor", stage: "register", status: "start", peer: endpoint.id });
+				nativeMeshDiagnostic.record({
+					component: "supervisor",
+					stage: "register",
+					status: "start",
+					peer: endpoint.id,
+				});
 				try {
 					await transport.register({
 						hostId: config.machineId,
@@ -4643,14 +4704,38 @@ export class DaemonSupervisor {
 						name,
 						state: "worker" in endpoint ? "active" : "inactive",
 					});
-					nativeMeshDiagnostic.record({ component: "supervisor",
+					if ("worker" in endpoint && this.nativeEndpoints) {
+						const binding = this.nativeEndpointBinding(endpoint);
+						try {
+							if (binding) {
+								const existing = this.nativeEndpoints.read(binding.machineId, binding.sessionId);
+								if (
+									existing &&
+									canonicalSessionPath(existing.sessionPath) !== canonicalSessionPath(binding.sessionPath)
+								) {
+									// Stop using this registry if durable quarantine fails; do not guess which file owns the identity.
+									try {
+										this.nativeEndpoints.quarantine(binding.machineId, binding.sessionId);
+									} catch (error) {
+										this.nativeEndpoints = undefined;
+										throw error;
+									}
+								} else this.nativeEndpoints.upsert(binding);
+							}
+						} catch {
+							this.log("Native mesh endpoint binding could not be saved; passive delivery unavailable");
+						}
+					}
+					nativeMeshDiagnostic.record({
+						component: "supervisor",
 						stage: "register",
 						status: "success",
 						peer: endpoint.id,
 						durationMs: Math.max(0, Date.now() - started),
 					});
 				} catch (error) {
-					nativeMeshDiagnostic.record({ component: "supervisor",
+					nativeMeshDiagnostic.record({
+						component: "supervisor",
 						stage: "register",
 						status: "unknown",
 						peer: endpoint.id,
@@ -4660,12 +4745,14 @@ export class DaemonSupervisor {
 				}
 			}),
 		);
-		nativeMeshDiagnostic.record({ component: "supervisor",
+		nativeMeshDiagnostic.record({
+			component: "supervisor",
 			stage: "register",
 			status: "success",
 			count: registered.filter((result) => result.status === "fulfilled").length,
 		});
-		nativeMeshDiagnostic.record({ component: "supervisor",
+		nativeMeshDiagnostic.record({
+			component: "supervisor",
 			stage: "register",
 			status: "unknown",
 			count: registered.filter((result) => result.status === "rejected").length,

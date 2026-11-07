@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { nativeMeshDiagnostic } from "../src/modes/daemon/native-mesh/diagnostic.js";
+import { NativeMeshEndpoints } from "../src/modes/daemon/native-mesh/endpoints.js";
 import { NativeMeshOperations } from "../src/modes/daemon/native-mesh/operations.js";
 import { NativeMeshOutbox } from "../src/modes/daemon/native-mesh/outbox.js";
 import { nativeMeshAgentId, nativeMeshRequestId } from "../src/modes/daemon/native-mesh/transport.js";
@@ -64,6 +65,7 @@ function setup() {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			nativeMeshConfig: { machineId: host, url: "http://127.0.0.1", token: "test" },
 			nativeMesh: transport,
+			nativeEndpoints: new NativeMeshEndpoints(join(directory, "endpoints")),
 			catalog: { list: vi.fn(async () => []) },
 			rlmSpawnLedger: () => ({ liveEdges: vi.fn(async () => []) }),
 			defaultSessionConfig: {},
@@ -105,6 +107,10 @@ function makePassive(b: ReturnType<typeof setup>["b"], wokeSessionId = "two") {
 		firstMessage: "",
 		allMessagesText: "",
 	};
+	b.supervisor.nativeEndpoints.upsert({
+		machineId: "host-b", sessionId: "two", sessionPath: path, rootPath: path, rootSessionId: "two",
+		ancestors: [], name: "two", cwd: b.directory, rlmDepth: 0,
+	});
 	const summary = { ...b.summary, sessionId: wokeSessionId, sessionFile: path };
 	Object.assign(b.worker, { descriptor: { lifecycle: "ready", rootActiveSessionId: summary.activeSessionId } });
 	delete b.supervisor.nativeLocalEndpoints;
@@ -118,6 +124,33 @@ function makePassive(b: ReturnType<typeof setup>["b"], wokeSessionId = "two") {
 		createOrReuseWorker: vi.fn(async () => b.worker),
 	});
 	return { path, info, summary };
+}
+// A live root with no pre-existing registry binding. Exercise the real roster
+// selection and registration path, then reopen the registry from disk.
+function makeActiveRoot(b: ReturnType<typeof setup>["b"]) {
+	const path = join(b.directory, "two.jsonl");
+	writeFileSync(path, `${JSON.stringify({ type: "session", version: 3, id: "two", timestamp: new Date().toISOString(), cwd: b.directory })}\n`);
+	Object.assign(b.summary, { sessionFile: path, cwd: b.directory });
+	Object.assign(b.worker, { descriptor: { workerId: "root-worker", lifecycle: "ready", rootActiveSessionId: b.summary.activeSessionId } });
+	delete b.supervisor.nativeLocalEndpoints;
+	b.supervisor.workers = new Map([["root-worker", b.worker]]);
+	b.supervisor.roster = () => ({
+		values: () => [{ workerId: "root-worker", summary: b.summary }],
+		byActiveSessionId: () => undefined,
+	});
+	return { path, registryDir: join(b.directory, "endpoints") };
+}
+function addPassiveChild(b: ReturnType<typeof setup>["b"], rootPath: string) {
+	const childPath = join(b.directory, "child.jsonl");
+	writeFileSync(childPath, `${JSON.stringify({ type: "session", version: 3, id: "child", timestamp: new Date().toISOString(), cwd: b.directory, parentSession: rootPath, rlmDepth: 1 })}\n`);
+	b.supervisor.nativeEndpoints.upsert({
+		machineId: "host-b", sessionId: "child", sessionPath: childPath, rootPath, rootSessionId: "two",
+		ancestors: [{ sessionId: "two", sessionPath: rootPath }], name: "child", cwd: b.directory, rlmDepth: 1,
+	});
+	b.supervisor.rlmSpawnLedger = () => ({
+		liveEdges: async () => [{ childId: "child", parent: rootPath, child: childPath, depth: 1, name: "child" }],
+	});
+	return { childPath, childId: nativeMeshAgentId("host-b", "child") };
 }
 function frame(supervisor: any, worker: any, source: any, type: string, requestId: string, attemptToken: string) {
 	supervisor.handleWorkerFrame(
@@ -279,6 +312,42 @@ describe("supervisor native mesh handoff", () => {
 });
 
 describe("supervisor native mesh inactive delivery", () => {
+	it("persists a successfully registered live root and polls it after restart as inactive", async () => {
+		const { transport, b } = setup();
+		const root = makeActiveRoot(b);
+		expect(b.supervisor.nativeEndpoints.read("host-b", "two")).toBeUndefined();
+		await b.supervisor.sweepNativeMesh();
+		expect(transport.register).toHaveBeenCalledWith(expect.objectContaining({
+			hostId: "host-b", agentId: "two", state: "active", parentId: null,
+		}));
+		const reopened = new NativeMeshEndpoints(root.registryDir);
+		expect(reopened.read("host-b", "two")).toMatchObject({
+			machineId: "host-b", sessionId: "two", sessionPath: root.path, rootPath: root.path,
+			rootSessionId: "two", ancestors: [], cwd: b.directory,
+		});
+		// Simulate a restarted supervisor with no live workers, preserving only the
+		// durable registry. Do not seed the passive fixture or manually register it.
+		b.supervisor.nativeEndpoints = reopened;
+		b.supervisor.workers = new Map();
+		b.supervisor.roster = () => ({ values: () => [], byActiveSessionId: () => undefined });
+		transport.register.mockClear();
+		transport.pending.mockClear();
+		await b.supervisor.sweepNativeMesh();
+		expect(transport.register).toHaveBeenCalledWith(expect.objectContaining({
+			hostId: "host-b", agentId: "two", state: "inactive", parentId: null,
+		}));
+		expect(transport.pending).toHaveBeenCalledWith(b.id);
+	});
+
+	it("never persists a live endpoint when broker registration is rejected", async () => {
+		const { transport, b } = setup();
+		const root = makeActiveRoot(b);
+		transport.register.mockRejectedValueOnce(new Error("registration refused"));
+		await b.supervisor.sweepNativeMesh();
+		expect(transport.register).toHaveBeenCalledOnce();
+		expect(new NativeMeshEndpoints(root.registryDir).read("host-b", "two")).toBeUndefined();
+	});
+
 	it("stores to a freshly observed inactive remote identity but rejects a stale observation", async () => {
 		const { a, b, transport } = setup();
 		makePassive(b);
@@ -312,37 +381,94 @@ describe("supervisor native mesh inactive delivery", () => {
 		expect(transport.acknowledge).not.toHaveBeenCalled();
 	});
 
-	it("builds passive identities and parent chains from the saved catalog and live spawn ledger", async () => {
+	it("builds only registered passive identities and parent chains", async () => {
 		const { transport, b } = setup();
 		const root = makePassive(b);
-		const childPath = join(b.directory, "child.jsonl");
-		writeFileSync(
-			childPath,
-			`${JSON.stringify({ type: "session", version: 3, id: "child", timestamp: new Date().toISOString(), cwd: b.directory, parentSession: root.path, rlmDepth: 1 })}\n`,
-		);
-		b.supervisor.rlmSpawnLedger = () => ({
-			liveEdges: async () => [{ childId: "child", parent: root.path, child: childPath, depth: 1, name: "child" }],
-		});
+		const { childId } = addPassiveChild(b, root.path);
 		await b.supervisor.sweepNativeMesh();
-		const childId = nativeMeshAgentId("host-b", "child");
-		expect(transport.register).toHaveBeenCalledWith(
-			expect.objectContaining({
-				hostId: "host-b",
-				agentId: "two",
-				state: "inactive",
-				parentId: null,
-			}),
-		);
-		expect(transport.register).toHaveBeenCalledWith(
-			expect.objectContaining({
-				hostId: "host-b",
-				agentId: "child",
-				state: "inactive",
-				parentId: b.id,
-			}),
-		);
+		expect(transport.register).toHaveBeenCalledWith(expect.objectContaining({
+			hostId: "host-b", agentId: "two", state: "inactive", parentId: null,
+		}));
+		expect(transport.register).toHaveBeenCalledWith(expect.objectContaining({
+			hostId: "host-b", agentId: "child", state: "inactive", parentId: b.id,
+		}));
 		expect(transport.pending).toHaveBeenCalledWith(b.id);
 		expect(transport.pending).toHaveBeenCalledWith(childId);
+		expect(b.supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+	});
+
+	it("rotates a 64-endpoint sweep budget across all registered passive identities", async () => {
+		const { transport, b } = setup();
+		// In-memory registry isolates the scheduling contract from disk I/O.
+		const bindings = Array.from({ length: 100 }, (_, index) => {
+			const sessionId = `saved-${index}`;
+			const sessionPath = join(b.directory, `${sessionId}.jsonl`);
+			return { machineId: "host-b", sessionId, sessionPath, rootPath: sessionPath, rootSessionId: sessionId,
+				ancestors: [], name: sessionId, cwd: b.directory, rlmDepth: 0 };
+		});
+		b.supervisor.nativeEndpoints = { list: vi.fn(() => bindings) };
+		b.supervisor.nativeLocalEndpoints = () => [];
+		b.supervisor.nativeOperations = { pending: () => [] };
+		b.supervisor.nativeOutbox = { pending: () => [] };
+		const expected = new Set(bindings.map((binding) => nativeMeshAgentId("host-b", binding.sessionId)));
+		const registered = new Set<string>();
+		const polled = new Set<string>();
+		for (let sweep = 0; sweep < 2; sweep++) {
+			transport.register.mockClear();
+			transport.pending.mockClear();
+			await b.supervisor.sweepNativeMesh();
+			expect(transport.register.mock.calls.length).toBeLessThanOrEqual(64);
+			expect(transport.pending.mock.calls.length).toBeLessThanOrEqual(64);
+			expect(transport.register.mock.calls.length).toBeGreaterThan(0);
+			for (const [registration] of transport.register.mock.calls)
+				registered.add(nativeMeshAgentId(registration.hostId, registration.agentId));
+			for (const [id] of transport.pending.mock.calls) polled.add(id);
+		}
+		expect(registered).toEqual(expected);
+		expect(polled).toEqual(expected);
+	});
+
+	it("keeps a registered inactive child passive when its root worker remains live", async () => {
+		const { transport, b } = setup();
+		const root = makePassive(b);
+		const { childId, childPath } = addPassiveChild(b, root.path);
+		Object.assign(b.worker.descriptor, { workerId: "root-worker" });
+		b.supervisor.workers = new Map([["root-worker", b.worker]]);
+		const rootSummary = { ...root.summary, cwd: b.directory };
+		const childSummary = { ...rootSummary, id: "child", activeSessionId: undefined, sessionId: "child",
+			sessionFile: childPath, sessionName: "child", rlmDepth: 1, parentSessionId: "two" };
+		b.supervisor.roster = () => ({
+			values: () => [
+				{ workerId: "root-worker", summary: rootSummary },
+				{ workerId: "root-worker", summary: childSummary },
+			],
+			byActiveSessionId: () => undefined,
+		});
+		await b.supervisor.sweepNativeMesh();
+		expect(transport.register).toHaveBeenCalledWith(expect.objectContaining({
+			agentId: "two", state: "active", parentId: null,
+		}));
+		expect(transport.register).toHaveBeenCalledWith(expect.objectContaining({
+			agentId: "child", state: "inactive", parentId: b.id,
+		}));
+		expect(transport.pending).toHaveBeenCalledWith(childId);
+		expect(b.supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+	});
+
+	it("never registers or polls an unregistered historical session even if present in the catalog", async () => {
+		const { transport, b } = setup();
+		const root = makePassive(b);
+		const historyPath = join(b.directory, "history.jsonl");
+		writeFileSync(historyPath, `${JSON.stringify({ type: "session", version: 3, id: "history", timestamp: new Date().toISOString(), cwd: b.directory })}\n`);
+		const history = { ...root.info, id: "history", path: historyPath, name: "history" };
+		b.supervisor.catalog.list.mockResolvedValue([root.info, history]);
+		const historyId = nativeMeshAgentId("host-b", "history");
+		await b.supervisor.sweepNativeMesh();
+		await b.supervisor.sweepNativeMesh();
+		expect(transport.register).toHaveBeenCalledWith(expect.objectContaining({ agentId: "two", state: "inactive" }));
+		expect(transport.register).not.toHaveBeenCalledWith(expect.objectContaining({ agentId: "history" }));
+		expect(transport.pending).not.toHaveBeenCalledWith(historyId);
+		expect(b.supervisor.nativeEndpoints.read("host-b", "history")).toBeUndefined();
 		expect(b.supervisor.createOrReuseWorker).not.toHaveBeenCalled();
 	});
 
@@ -403,6 +529,73 @@ describe("supervisor native mesh inactive delivery", () => {
 		// A persistence frame can arrive before requestWorker returns.
 		replyToWorker({ success: true });
 		await settle();
+	});
+
+	it("delivers old pending mail for a registered target and ACKs only after persistence", async () => {
+		const { transport, messages, a, b } = setup();
+		makePassive(b);
+		await a.supervisor.sweepNativeMesh();
+		await b.supervisor.sweepNativeMesh();
+		const stored = await transport.store({ from: a.id, to: b.id, text: "old pending", callerMessageId: "old-op" });
+		// Simulate an item stored long before this supervisor restarted. It remains in
+		// the broker queue; neither the test nor the supervisor removes it manually.
+		messages.get(stored.requestId).createdAt = "2000-01-01T00:00:00.000Z";
+		await b.supervisor.sweepNativeMesh();
+		await settle();
+		const delivery = b.recipient.requestWorker.mock.calls[0]![0] as any;
+		expect(delivery).toMatchObject({ requestId: stored.requestId, expectedSessionId: "two", message: "old pending" });
+		expect(transport.acknowledge).not.toHaveBeenCalled();
+		expect((await transport.pending(b.id)).map((m: any) => m.requestId)).toContain(stored.requestId);
+		frame(b.supervisor, b.worker, b.recipient, "native_mesh_message_persisted", delivery.requestId, delivery.attemptToken);
+		await settle();
+		expect(transport.acknowledge).toHaveBeenCalledExactlyOnceWith(stored.requestId);
+		expect(await transport.pending(b.id)).toEqual([]);
+		expect(messages.get(stored.requestId)).toMatchObject({ text: "old pending", createdAt: "2000-01-01T00:00:00.000Z", acknowledgedAt: expect.any(String) });
+	});
+
+	it("coalesces concurrent wakes for two registered targets under one root without losing either message", async () => {
+		const { transport, a, b } = setup();
+		const root = makePassive(b);
+		const { childId } = addPassiveChild(b, root.path);
+		await a.supervisor.sweepNativeMesh();
+		await b.supervisor.sweepNativeMesh();
+		const first = await transport.store({ from: a.id, to: b.id, text: "root mail", callerMessageId: "root-op" });
+		const second = await transport.store({ from: b.id, to: childId, text: "child mail", callerMessageId: "child-op" });
+		// Keep createOrReuseWorker and its per-path opening lock real. Only the
+		// process launch is held at a barrier so the other endpoint can join it.
+		delete b.supervisor.createOrReuseWorker;
+		b.supervisor.defaultSessionConfig = { agentDir: b.directory };
+		b.supervisor.activeSessionMoves = new Set();
+		b.supervisor.openingWorkers = new Map();
+		b.supervisor.catalogOpeningWorkers = new Map();
+		b.supervisor.matchWorkers = vi.fn(() => []);
+		b.supervisor.findWorkerBySessionFile = vi.fn(() => undefined);
+		let release!: (worker: typeof b.worker) => void;
+		const workerReady = new Promise<typeof b.worker>((resolve) => { release = resolve; });
+		b.supervisor.launchWorker = vi.fn(() => workerReady);
+		const join = vi.spyOn(b.supervisor, "joinOpeningWorker");
+		const sweeping = b.supervisor.sweepNativeMesh();
+		await vi.waitFor(() => expect(join).toHaveBeenCalledOnce());
+		expect(b.supervisor.launchWorker).toHaveBeenCalledOnce();
+		release(b.worker);
+		await sweeping;
+		await settle();
+		expect(b.supervisor.launchWorker).toHaveBeenCalledOnce();
+		const deliveries = b.recipient.requestWorker.mock.calls.map((call: any[]) => call[0]);
+		expect(deliveries).toHaveLength(2);
+		expect(deliveries).toEqual(expect.arrayContaining([
+			expect.objectContaining({ requestId: first.requestId, expectedSessionId: "two", message: "root mail" }),
+			expect.objectContaining({ requestId: second.requestId, expectedSessionId: "child", message: "child mail" }),
+		]));
+		expect(transport.acknowledge).not.toHaveBeenCalled();
+		for (const delivery of deliveries)
+			frame(b.supervisor, b.worker, b.recipient, "native_mesh_message_persisted", delivery.requestId, delivery.attemptToken);
+		await settle();
+		expect(transport.acknowledge).toHaveBeenCalledTimes(2);
+		expect(transport.acknowledge).toHaveBeenCalledWith(first.requestId);
+		expect(transport.acknowledge).toHaveBeenCalledWith(second.requestId);
+		expect(await transport.pending(b.id)).toEqual([]);
+		expect(await transport.pending(childId)).toEqual([]);
 	});
 
 	it("does not wake for mail from an unknown identity", async () => {
