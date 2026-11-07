@@ -1,7 +1,8 @@
 /**
  * Opt-in, best-effort local diagnostics. No production transport depends on it.
- * Only explicitly allowlisted fields are written. Never put content, tokens or
- * paths in numeric fields. peer is a process-local HMAC alias. message is a
+ * Only explicitly allowlisted fields are written. The opt-in workerError field
+ * contains the full worker RPC error and may contain sensitive data. peer is a
+ * process-local HMAC alias. message is a
  * 128-bit SHA-256 prefix of a native request ID for broker correlation. It is
  * pseudonymous, not anonymous: anyone knowing an ID can match its digest.
  *
@@ -49,11 +50,11 @@ const COMPONENTS = ["supervisor", "worker", "unknown"] as const;
 const STATUSES = ["start", "success", "failure", "unknown", "skipped", "drop"] as const;
 const REASONS = ["timeout", "network", "http", "invalid", "aborted", "other"] as const;
 const OPERATIONS = ["register", "discover", "pending", "store", "acknowledge"] as const;
-const MAX_TTL_MS = 15 * 60 * 1000;
-const MAX_LOG_BYTES = 1024 * 1024;
-const MAX_EVENTS_PER_SECOND = 50;
+const MAX_TTL_MS = 60 * 60 * 1000;
+const MAX_LOG_BYTES = 128 * 1024 * 1024;
+const MAX_EVENTS_PER_SECOND = 1000;
 const MAX_NUMBER = 0x7fffffff;
-const MAX_QUEUE_BYTES = 64 * 1024;
+const MAX_QUEUE_BYTES = 4 * 1024 * 1024;
 const DROP_RESERVE_BYTES = 1024;
 const CLOSE_WAIT_MS = 2000;
 /** Local, cross-platform opt-in. Contents are ignored; the flag is read only once per process. */
@@ -87,6 +88,8 @@ export interface NativeMeshDiagnosticEvent {
 	count?: number;
 	bytes?: number;
 	httpStatus?: number;
+	/** Full worker RPC error, which may contain sensitive data. */
+	workerError?: string;
 }
 export interface NativeMeshDiagnosticOptions {
 	enabled?: boolean;
@@ -258,6 +261,7 @@ export function createNativeMeshDiagnostic(options?: NativeMeshDiagnosticOptions
 					count,
 					bytes,
 					httpStatus,
+					workerError,
 				} = event;
 				if (!allowed(STAGES, stage) || !allowed(STATUSES, status)) return;
 				if (component !== undefined && !allowed(COMPONENTS, component)) return;
@@ -267,6 +271,7 @@ export function createNativeMeshDiagnostic(options?: NativeMeshDiagnosticOptions
 					if (value !== undefined && !integer(value, 0, MAX_NUMBER)) return;
 				}
 				if (httpStatus !== undefined && !integer(httpStatus, 100, 599)) return;
+				if (workerError !== undefined && typeof workerError !== "string") return;
 				const alias = (domain: string, value: unknown): string | undefined => {
 					if (value === undefined) return undefined;
 					if (
@@ -320,6 +325,7 @@ export function createNativeMeshDiagnostic(options?: NativeMeshDiagnosticOptions
 					count,
 					bytes,
 					httpStatus,
+					workerError,
 				})}\n`;
 				const size = Buffer.byteLength(line);
 				if (
@@ -350,12 +356,14 @@ function fromEnvironment(): NativeMeshDiagnostic {
 		const enabled = process.env.PI_NATIVE_MESH_DIAGNOSTIC;
 		if (enabled !== undefined) {
 			const raw = process.env.PI_NATIVE_MESH_DIAGNOSTIC_TTL_MS;
-			if (enabled !== "1" || !raw || !/^[0-9]{1,6}$/.test(raw)) return disabled();
+			if (enabled !== "1" || !raw || !/^[0-9]{1,7}$/.test(raw)) return disabled();
 			return createNativeMeshDiagnostic({ enabled: true, ttlMs: Number(raw) });
 		}
-		return existsSync(NATIVE_MESH_DIAGNOSTIC_FLAG)
-			? createNativeMeshDiagnostic({ enabled: true, ttlMs: MAX_TTL_MS })
-			: disabled();
+		const systemTmpFlag = "/tmp/prime-team-native-mesh-diagnostic.enable";
+		const enabledByFlag =
+			existsSync(NATIVE_MESH_DIAGNOSTIC_FLAG) ||
+			((process.platform === "darwin" || process.platform === "linux") && existsSync(systemTmpFlag));
+		return enabledByFlag ? createNativeMeshDiagnostic({ enabled: true, ttlMs: MAX_TTL_MS }) : disabled();
 	} catch {
 		return disabled();
 	}

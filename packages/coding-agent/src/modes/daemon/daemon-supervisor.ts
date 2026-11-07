@@ -4665,6 +4665,7 @@ export class DaemonSupervisor {
 								peer: endpoint.id,
 								subject: message.requestId,
 								durationMs: Date.now() - attempt.started,
+								...(!response.success ? { workerError: response.error } : {}),
 							});
 							if (!response.success && this.nativeAttempts.get(message.requestId) === attempt)
 								this.nativeAttempts.delete(message.requestId);
