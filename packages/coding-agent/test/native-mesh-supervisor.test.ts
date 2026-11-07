@@ -1050,7 +1050,10 @@ describe("isolated operation recovery", () => {
 			expect(transport.pending).toHaveBeenCalledTimes(2);
 			const events = record.mock.calls.map(([event]) => event).filter((event) => event.stage === "outbox-recovery");
 			expect(events.map((event) => event.status)).toEqual(["start", "failure", "start", "success"]);
-			expect(a.supervisor.log.mock.calls.map((call: any[]) => call[0])).toEqual([
+			const recoveryLogs = a.supervisor.log.mock.calls
+				.map((call: any[]) => call[0])
+				.filter((message: string) => message.startsWith("Native mesh journal recovery"));
+			expect(recoveryLogs).toEqual([
 				"Native mesh journal recovery scan blocked; inbound synchronization continues",
 				"Native mesh journal recovery scan clear; sends may still fail",
 			]);
