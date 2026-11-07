@@ -811,6 +811,9 @@ export class DaemonSupervisor {
 	private nativeMeshSweep?: Promise<void>;
 	private nativeMeshRecoveryFailed = false;
 	private readonly nativeOutboxSends = new Set<Promise<void>>();
+	/** A slow session launch must never hold the supervisor-wide mesh sweep. */
+	private nativeEndpointHandoffs?: Map<string, Promise<void>>;
+	private nativePassiveHandoffIds?: Set<string>;
 	private nativeObservations = new Map<string, NativeMeshObservation>();
 	private readonly nativeAttempts = new Map<
 		string,
@@ -4840,6 +4843,8 @@ export class DaemonSupervisor {
 		this.nativeObservations = new Map(discovered.map((entry) => [entry.id, entry]));
 		const pendingResults = await Promise.allSettled(
 			endpoints.map(async (endpoint) => {
+				if (this.nativeEndpointHandoffs?.has(endpoint.id)) return;
+				if (!("worker" in endpoint) && (this.nativePassiveHandoffIds?.size ?? 0) >= 16) return;
 				const started = Date.now();
 				nativeMeshDiagnostic.record({ component: "supervisor", stage: "pending", status: "start", peer: endpoint.id });
 				let messages: Awaited<ReturnType<NativeMeshTransport["pending"]>>;
@@ -4861,120 +4866,33 @@ export class DaemonSupervisor {
 					});
 					throw error;
 				}
-				for (const message of messages) {
-					if (this.shuttingDown) return;
-					const old = this.nativeAttempts.get(message.requestId);
-					if (
-						old &&
-						(old.confirming ||
-							(Date.now() - old.started < 60_000 &&
-								(!("worker" in endpoint) || old.source === endpoint.worker.client)))
-					) {
-						nativeMeshDiagnostic.record({ component: "supervisor",
-							stage: "handoff",
-							status: "skipped",
-							peer: endpoint.id,
-							subject: message.requestId,
-						});
-						continue;
+				if (messages.length === 0 || this.shuttingDown) return;
+				const handoffs = (this.nativeEndpointHandoffs ??= new Map());
+				if (handoffs.has(endpoint.id)) return;
+				const passive = !("worker" in endpoint);
+				const passiveHandoffs = (this.nativePassiveHandoffIds ??= new Set());
+				if (passive && passiveHandoffs.size >= 16) return;
+				if (passive) passiveHandoffs.add(endpoint.id);
+				const handoff = this.handoffNativeMeshMessages(endpoint, messages).catch(() => {
+					this.log("Native mesh handoff failed; pending messages retained");
+				});
+				handoffs.set(endpoint.id, handoff);
+				void handoff.finally(() => {
+					if (handoffs.get(endpoint.id) === handoff) {
+						handoffs.delete(endpoint.id);
+						if (passive) passiveHandoffs.delete(endpoint.id);
 					}
-					const recipient = this.nativeObservations.get(endpoint.id);
-					const sender = this.nativeObservations.get(message.from);
-					const recipientFamily = recipient && this.nativeFamilyEntry(recipient);
-					const senderFamily = sender && this.nativeFamilyEntry(sender);
-					if (
-						!recipientFamily ||
-						!senderFamily ||
-						message.from === endpoint.id ||
-						!agentFamilyRelationship(recipientFamily, senderFamily)
-					) {
-						nativeMeshDiagnostic.record({ component: "supervisor",
-							stage: "family",
-							status: "skipped",
-							peer: endpoint.id,
-							subject: message.requestId,
-						});
-						continue;
-					}
-					nativeMeshDiagnostic.record({ component: "supervisor",
-						stage: "family",
-						status: "success",
-						peer: endpoint.id,
-						subject: message.requestId,
-					});
-					let target: WorkerMatch;
-					try {
-						target = "worker" in endpoint ? endpoint : await this.wakeNativeMeshEndpoint(endpoint);
-					} catch {
-						// Do not acknowledge: a later sweep retries after the session can be opened.
-						continue;
-					}
-					const source = target.worker.client;
-					if (!source) {
-						nativeMeshDiagnostic.record({ component: "supervisor",
-							stage: "handoff",
-							status: "skipped",
-							peer: endpoint.id,
-							subject: message.requestId,
-						});
-						continue;
-					}
-					const token = randomUUID();
-					const attempt = { source, token, started: Date.now() };
-					this.nativeAttempts.set(message.requestId, attempt);
-					nativeMeshDiagnostic.record({ component: "supervisor",
-						stage: "handoff",
-						status: "start",
-						peer: endpoint.id,
-						subject: message.requestId,
-					});
-					// Bind the attempt before the request: persistence may be reported before its response.
-					void source
-						.requestWorker(
-							{
-								type: "worker_native_mesh_deliver_message",
-								targetActiveSessionId: target.summary.activeSessionId!,
-								expectedSessionId: endpoint.summary.sessionId,
-								message: message.text,
-								sender: { clientId: message.from },
-								fromRelationship: agentFamilyRelationship(recipientFamily, senderFamily),
-								requestId: message.requestId,
-								attemptToken: token,
-							},
-							30_000,
-						)
-						.then((response) => {
-							nativeMeshDiagnostic.record({ component: "supervisor",
-								stage: "handoff",
-								status: response.success ? "success" : "failure",
-								peer: endpoint.id,
-								subject: message.requestId,
-								durationMs: Date.now() - attempt.started,
-								...(!response.success ? { workerError: response.error } : {}),
-							});
-							if (!response.success && this.nativeAttempts.get(message.requestId) === attempt)
-								this.nativeAttempts.delete(message.requestId);
-						})
-						.catch(() => {
-							nativeMeshDiagnostic.record({ component: "supervisor",
-								stage: "handoff",
-								status: "unknown",
-								peer: endpoint.id,
-								subject: message.requestId,
-								durationMs: Date.now() - attempt.started,
-							});
-							if (this.nativeAttempts.get(message.requestId) === attempt)
-								this.nativeAttempts.delete(message.requestId);
-						});
-				}
+				});
 			}),
 		);
-		nativeMeshDiagnostic.record({ component: "supervisor",
+		nativeMeshDiagnostic.record({
+			component: "supervisor",
 			stage: "pending",
 			status: "success",
 			count: pendingResults.filter((result) => result.status === "fulfilled").length,
 		});
-		nativeMeshDiagnostic.record({ component: "supervisor",
+		nativeMeshDiagnostic.record({
+			component: "supervisor",
 			stage: "pending",
 			status: "unknown",
 			count: pendingResults.filter((result) => result.status === "rejected").length,
@@ -4992,6 +4910,159 @@ export class DaemonSupervisor {
 			binding.operationId !== item.callerMessageId
 		)
 			throw new Error("Native mesh operation and outbox disagree");
+	}
+
+	private async handoffNativeMeshMessages(
+		endpoint: ReturnType<DaemonSupervisor["nativeLocalEndpoints"]>[number] | NativeMeshPassiveEndpoint,
+		messages: Awaited<ReturnType<NativeMeshTransport["pending"]>>,
+	): Promise<void> {
+		for (const message of messages) {
+			if (this.shuttingDown) return;
+			const old = this.nativeAttempts.get(message.requestId);
+			if (
+				old &&
+				(old.confirming ||
+					(Date.now() - old.started < 60_000 &&
+						(!("worker" in endpoint) || old.source === endpoint.worker.client)))
+			) {
+				nativeMeshDiagnostic.record({
+					component: "supervisor",
+					stage: "handoff",
+					status: "skipped",
+					peer: endpoint.id,
+					subject: message.requestId,
+				});
+				continue;
+			}
+			const recipient = this.nativeObservations.get(endpoint.id);
+			const sender = this.nativeObservations.get(message.from);
+			const recipientFamily = recipient && this.nativeFamilyEntry(recipient);
+			const senderFamily = sender && this.nativeFamilyEntry(sender);
+			if (
+				!recipientFamily ||
+				!senderFamily ||
+				message.from === endpoint.id ||
+				!agentFamilyRelationship(recipientFamily, senderFamily)
+			) {
+				nativeMeshDiagnostic.record({
+					component: "supervisor",
+					stage: "family",
+					status: "skipped",
+					peer: endpoint.id,
+					subject: message.requestId,
+				});
+				continue;
+			}
+			nativeMeshDiagnostic.record({
+				component: "supervisor",
+				stage: "family",
+				status: "success",
+				peer: endpoint.id,
+				subject: message.requestId,
+			});
+			let target: WorkerMatch;
+			let timedOut = false;
+			const timer =
+				"worker" in endpoint
+					? undefined
+					: setTimeout(() => {
+							timedOut = true;
+							this.log("Native mesh wake is still running; retaining pending messages");
+						}, 30_000);
+			timer?.unref();
+			try {
+				target = "worker" in endpoint ? endpoint : await this.wakeNativeMeshEndpoint(endpoint);
+			} catch {
+				// Do not acknowledge: a later sweep retries after the session can be opened.
+				continue;
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+			// A timed-out open stays fenced until it actually settles. Retry on a later
+			// sweep, which can reuse its worker, rather than deliver a stale attempt.
+			if (timedOut || this.shuttingDown) return;
+			if (!("worker" in endpoint)) {
+				const current = this.nativeEndpoints?.read(endpoint.binding.machineId, endpoint.binding.sessionId);
+				if (
+					!current ||
+					current.sessionPath !== endpoint.binding.sessionPath ||
+					current.rootPath !== endpoint.binding.rootPath ||
+					current.rootSessionId !== endpoint.binding.rootSessionId ||
+					JSON.stringify(current.ancestors) !== JSON.stringify(endpoint.binding.ancestors)
+				)
+					return;
+			}
+			const currentRecipient = this.nativeObservations.get(endpoint.id);
+			const currentSender = this.nativeObservations.get(message.from);
+			const currentRecipientFamily = currentRecipient && this.nativeFamilyEntry(currentRecipient);
+			const currentSenderFamily = currentSender && this.nativeFamilyEntry(currentSender);
+			const relationship =
+				currentRecipientFamily &&
+				currentSenderFamily &&
+				agentFamilyRelationship(currentRecipientFamily, currentSenderFamily);
+			if (!relationship) continue;
+			const source = target.worker.client;
+			if (!source) {
+				nativeMeshDiagnostic.record({
+					component: "supervisor",
+					stage: "handoff",
+					status: "skipped",
+					peer: endpoint.id,
+					subject: message.requestId,
+				});
+				continue;
+			}
+			const token = randomUUID();
+			const attempt = { source, token, started: Date.now() };
+			this.nativeAttempts.set(message.requestId, attempt);
+			nativeMeshDiagnostic.record({
+				component: "supervisor",
+				stage: "handoff",
+				status: "start",
+				peer: endpoint.id,
+				subject: message.requestId,
+			});
+			// Bind the attempt before the request: persistence may be reported before its response.
+			void source
+				.requestWorker(
+					{
+						type: "worker_native_mesh_deliver_message",
+						targetActiveSessionId: target.summary.activeSessionId!,
+						expectedSessionId: endpoint.summary.sessionId,
+						message: message.text,
+						sender: { clientId: message.from },
+						fromRelationship: relationship,
+						requestId: message.requestId,
+						attemptToken: token,
+					},
+					30_000,
+				)
+				.then((response) => {
+					nativeMeshDiagnostic.record({
+						component: "supervisor",
+						stage: "handoff",
+						status: response.success ? "success" : "failure",
+						peer: endpoint.id,
+						subject: message.requestId,
+						durationMs: Date.now() - attempt.started,
+						...(!response.success ? { workerError: response.error } : {}),
+					});
+					if (!response.success && this.nativeAttempts.get(message.requestId) === attempt)
+						this.nativeAttempts.delete(message.requestId);
+				})
+				.catch(() => {
+					nativeMeshDiagnostic.record({
+						component: "supervisor",
+						stage: "handoff",
+						status: "unknown",
+						peer: endpoint.id,
+						subject: message.requestId,
+						durationMs: Date.now() - attempt.started,
+					});
+					if (this.nativeAttempts.get(message.requestId) === attempt)
+						this.nativeAttempts.delete(message.requestId);
+				});
+		}
 	}
 
 	private async sendNativeOutbox(id: string): Promise<void> {
