@@ -340,7 +340,7 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 			this.observedHello ??= mockState.hello;
 			mockState.calls.push(`daemon-request:${request.type}`);
 			mockState.requestPayloads.push(request);
-			if (request.type === "restore_next_turn" || request.type === "restore_actions") {
+			if (request.type === "stage_next_turn" || request.type === "restore_actions") {
 				mockState.markerAtRestore.push(existsSync(`${mockState.preparedManifestPath}.restore-attempted`));
 			}
 			if (mockState.disconnectRequestTypes.includes(request.type)) {
@@ -381,7 +381,7 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 				mockState.restoreActionFailures--;
 				return { success: false, error: "restore failed" };
 			}
-			if (request.type === "restore_next_turn" && mockState.restoreNextTurnFailures > 0) {
+			if (request.type === "stage_next_turn" && mockState.restoreNextTurnFailures > 0) {
 				mockState.restoreNextTurnFailures--;
 				return { success: false, error: "restore failed" };
 			}
@@ -938,7 +938,7 @@ describe("self-update daemon restart", () => {
 				phase: "complete",
 				counts: { total: 1, restored: 1, resumed: 0, failed: 0 },
 			});
-			expect(mockState.requestPayloads.map((request) => request.type)).toContain("restore_next_turn");
+			expect(mockState.requestPayloads.map((request) => request.type)).toContain("stage_next_turn");
 		} finally {
 			errorSpy.mockRestore();
 		}
@@ -1167,7 +1167,12 @@ describe("self-update daemon restart", () => {
 				]);
 				expect(mockState.lastCoordinatorStatus?.failures?.[0]?.message).toContain("restore failed");
 				expect(JSON.parse(readFileSync(mockState.preparedManifestPath, "utf8"))).toEqual(mockState.prepareManifest);
-				expect(mockState.requestPayloads.map((request) => request.type)).toContain(command);
+				expect(mockState.requestPayloads.map((request) => request.type)).toContain(
+					command === "restore_next_turn" ? "stage_next_turn" : command,
+				);
+				expect(mockState.requestPayloads.some((request) => request.type === "commit_restore_next_turn")).toBe(
+					false,
+				);
 				expect(mockState.requestPayloads.some((request) => request.type === "prompt")).toBe(false);
 				expect(mockState.markerAtRestore).not.toContain(false);
 				const markerPath = `${mockState.preparedManifestPath}.restore-attempted`;
@@ -1196,9 +1201,14 @@ describe("self-update daemon restart", () => {
 					mockState.requestPayloads
 						.slice(requests)
 						.filter((request) =>
-							["create", "restore_next_turn", "restore_actions", "prompt", "resume_queue"].includes(
-								request.type,
-							),
+							[
+								"create",
+								"stage_next_turn",
+								"commit_restore_next_turn",
+								"restore_actions",
+								"prompt",
+								"resume_queue",
+							].includes(request.type),
 						),
 				).toEqual([]);
 				expect(existsSync(mockState.preparedManifestPath)).toBe(true);
@@ -1208,6 +1218,69 @@ describe("self-update daemon restart", () => {
 			}
 		},
 	);
+
+	it.each([false, true])(
+		"stages next-turn context until queued actions are restored (commit failure: %s)",
+		async (failCommit) => {
+			const nextTurn: MockCustomMessage = {
+				role: "custom",
+				customType: "test",
+				content: "pending",
+				display: true,
+				timestamp: 1,
+			};
+			mockState.prepareManifest = createAcceptedRecoveryManifest([nextTurn]);
+			if (failCommit) mockState.requestThrowTypes = ["commit_restore_next_turn"];
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			try {
+				await performUpdateAndRunCoordinator();
+				const types = mockState.requestPayloads.map((request) => request.type);
+				expect(types.indexOf("stage_next_turn")).toBeLessThan(types.indexOf("restore_actions"));
+				expect(types.indexOf("restore_actions")).toBeLessThan(types.indexOf("commit_restore_next_turn"));
+				if (failCommit) {
+					expect(mockState.lastCoordinatorStatus?.counts.failed).toBe(1);
+					expect(mockState.lastCoordinatorStatus?.failures?.[0]?.message).toContain("commit_restore_next_turn");
+					expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+					expect(types).not.toContain("prompt");
+					expect(types).not.toContain("resume_queue");
+				} else {
+					expect(mockState.lastCoordinatorStatus?.counts.failed).toBe(0);
+					expect(existsSync(mockState.preparedManifestPath)).toBe(false);
+				}
+			} finally {
+				errorSpy.mockRestore();
+				logSpy.mockRestore();
+			}
+		},
+	);
+
+	it("commits staged next-turn context for an otherwise idle session", async () => {
+		const nextTurn: MockCustomMessage = {
+			role: "custom",
+			customType: "test",
+			content: "pending",
+			display: true,
+			timestamp: 1,
+		};
+		const manifest = createAcceptedRecoveryManifest([nextTurn]);
+		const session = manifest.sessions[0]!;
+		session.queue.actions.actions = [];
+		session.shouldResume = false;
+		session.hadAcceptedPromptInFlight = false;
+		mockState.prepareManifest = manifest;
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			await performUpdateAndRunCoordinator();
+			const types = mockState.requestPayloads.map((request) => request.type);
+			expect(types).toContain("stage_next_turn");
+			expect(types).toContain("commit_restore_next_turn");
+			expect(types).not.toContain("restore_actions");
+			expect(mockState.lastCoordinatorStatus?.counts.failed).toBe(0);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
 
 	it("does not replay a continuation after restoring an accepted turn", async () => {
 		mockState.prepareManifest = createAcceptedRecoveryManifest();
@@ -1561,6 +1634,31 @@ describe("self-update daemon restart", () => {
 			await expect(performUpdateAndRunCoordinator()).resolves.toBeUndefined();
 			expect(mockState.requestPayloads.some((request) => request.type === "restore_actions")).toBe(true);
 			expect(mockState.requestPayloads.some((request) => request.type === "resume_queue")).toBe(true);
+			expect(mockState.lastCoordinatorStatus?.phase).toBe("failed");
+			expect(mockState.lastCoordinatorStatus?.counts).toMatchObject({
+				total: 1,
+				restored: 0,
+				resumed: 1,
+				failed: 1,
+			});
+			expect(mockState.lastCoordinatorStatus?.failures).toEqual([
+				{ sessionFile: join(projectDir, "session.jsonl"), message: "prompt: prompt failed" },
+			]);
+			expect(JSON.parse(readFileSync(mockState.preparedManifestPath, "utf8"))).toEqual(mockState.prepareManifest);
+			const markerPath = `${mockState.preparedManifestPath}.restore-attempted`;
+			expect(JSON.parse(readFileSync(markerPath, "utf8"))).toMatchObject({
+				progress: { restored: 0, resumed: 1, failed: 1 },
+				checkpoints: [{ activeSessionId: "restored-active", failure: "prompt: prompt failed" }],
+			});
+			const requestsBeforeRetry = mockState.requestPayloads.length;
+			const second = await runDaemonUpdateRestartCoordinator({
+				socketPath: mockState.socketPath,
+				agentDir,
+				statusPath: join(agentDir, "update-restarts", "second-status.json"),
+			});
+			expect(second.phase).toBe("failed");
+			expect(second.message).toMatch(/automatic replay.*disabled/);
+			expect(mockState.requestPayloads).toHaveLength(requestsBeforeRetry);
 		} finally {
 			errorSpy.mockRestore();
 			logSpy.mockRestore();

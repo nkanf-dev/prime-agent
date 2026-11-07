@@ -295,6 +295,8 @@ export function summaryForActiveSession(
 	hasRegisteredCronJob = false,
 ): SessionSummary {
 	const session = activeSession.runtime.session;
+	// Next-turn context is memory-owned work even when no turn is running.
+	const isSessionActive = session.isSessionActive || (session.getPendingNextTurnMessageSnapshots?.().length ?? 0) > 0;
 	const metadata = activeSession.runtime.metadata ?? { kind: "top-level" as const };
 	let modified = savedSession?.modified.toISOString();
 	if (!modified && session.sessionFile) {
@@ -335,7 +337,7 @@ export function summaryForActiveSession(
 		isCompacting: session.isCompacting,
 		isBashRunning: session.isBashRunning,
 		pendingToolCallsSize: session.state.pendingToolCalls.size,
-		isSessionActive: session.isSessionActive,
+		isSessionActive,
 		hasRunningRlmChildren: session.hasRunningRlmChildren(),
 		unfinishedActionCount: session.unfinishedActionCount,
 		attachedClients: activeSession.clients.size,
@@ -377,7 +379,7 @@ export function summaryForActiveSession(
 		id: activeSession.activeSessionId,
 		lifecycle: activeLifecycleForSession(activeSession),
 		activity: activeActivityForSession(activeSession),
-		isSessionActive: session.isSessionActive,
+		isSessionActive,
 		hasActiveHeartbeat: hasActiveHeartbeat || undefined,
 		hasRegisteredHeartbeat: hasRegisteredHeartbeat || undefined,
 		hasRegisteredCronJob: hasRegisteredCronJob || undefined,

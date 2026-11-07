@@ -3138,7 +3138,13 @@ export class AgentDaemon {
 				(admission) => admission.activeSessionId === state.activeSessionId && admission.status !== "cancelled",
 			) || state.runtime.session.hasPendingAdmissionWaiters;
 		return {
-			isSessionActive: summary.isSessionActive || summary.hasRunningRlmChildren === true || hasPendingAdmission,
+			// Next-turn context is only held in memory, including uncommitted recovery
+			// staging. Disposing this session would lose ownership of those messages.
+			isSessionActive:
+				summary.isSessionActive ||
+				summary.hasRunningRlmChildren === true ||
+				hasPendingAdmission ||
+				state.runtime.session.getPendingNextTurnMessageSnapshots().length > 0,
 			attachedClients: state.clients.size + state.pendingAttaches,
 			hasRegisteredCronJob: jobs.some((job) => !isHeartbeatCronJob(job)),
 			lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
@@ -4857,7 +4863,22 @@ export class AgentDaemon {
 			case "restore_next_turn": {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.restorePendingNextTurnMessages(command.messages);
+				this.scheduleRosterFlush(state);
 				return success(command.id, "restore_next_turn");
+			}
+
+			case "stage_next_turn": {
+				const state = this.getSessionState(command.activeSessionId);
+				state.runtime.session.stagePendingNextTurnMessages(command.messages);
+				this.scheduleRosterFlush(state);
+				return success(command.id, "stage_next_turn");
+			}
+
+			case "commit_restore_next_turn": {
+				const state = this.getSessionState(command.activeSessionId);
+				state.runtime.session.activateStagedNextTurnMessages();
+				this.scheduleRosterFlush(state);
+				return success(command.id, "commit_restore_next_turn");
 			}
 
 			case "restore_actions": {

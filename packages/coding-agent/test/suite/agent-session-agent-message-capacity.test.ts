@@ -191,6 +191,18 @@ describe("agent-message unfinished capacity", () => {
 		pause.release();
 	});
 
+	it("counts staged agent messages as owned without exposing them to ordinary turns", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const pending = Array.from({ length: 20 }, (_, i) => agentPrefix(harness, i));
+		harness.session.stagePendingNextTurnMessages(pending);
+		await expect(queueAgent(harness, 20)).rejects.toThrow(capacityError);
+		expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual(pending);
+		harness.session.activateStagedNextTurnMessages();
+		await expect(queueAgent(harness, 20)).rejects.toThrow(capacityError);
+		expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual(pending);
+	});
+
 	it("rejects a single incoming ordinary action carrying 21 distinct agent prefixes", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

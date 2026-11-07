@@ -1349,6 +1349,76 @@ describe("AgentSession rlm recursion", () => {
 		root.dispose();
 	});
 
+	it("keeps staged recovery context inert across unrelated turns and failed action restore", async () => {
+		let turns = 0;
+		const restored = createSession({
+			streamFn: () => {
+				turns++;
+				return streamAnswer("done");
+			},
+		});
+		const notice = {
+			role: "custom" as const,
+			customType: "rlm_child_terminal_notice",
+			content: "child finished",
+			display: true,
+			timestamp: 1,
+			details: { child: "original" },
+		};
+		restored.stagePendingNextTurnMessages([notice]);
+		notice.content = "mutated";
+		expect(restored.getPendingNextTurnMessageSnapshots()[0]?.content).toBe("child finished");
+		// Unrelated pause releases flush ordinary notices but must not publish staged ones.
+		const pause = restored.acquireQueuedWorkPause();
+		pause.release();
+		await restored.prompt("unrelated turn");
+		await restored.waitForIdle();
+		expect(turns).toBe(1);
+		expect(terminalNotices(restored)).toHaveLength(0);
+		expect(restored.getPendingNextTurnMessageSnapshots()).toHaveLength(1);
+
+		const source = createSession();
+		await source.restoreFollowUpMessage("recovered action");
+		const snapshot = source.getSessionActionRecoverySnapshot();
+		expect(snapshot.actions).toHaveLength(1);
+		await expect(
+			restored.restoreSessionActions({ ...snapshot, actions: [...snapshot.actions, ...snapshot.actions] }),
+		).rejects.toThrow("Duplicate session action id");
+		await restored.waitForSessionInputIdle();
+		expect(restored.unfinishedActionCount).toBe(0);
+		expect(terminalNotices(restored)).toHaveLength(0);
+		expect(restored.getPendingNextTurnMessageSnapshots()).toHaveLength(1);
+
+		expect(await restored.restoreSessionActions(snapshot)).toBe(1);
+		expect(restored.getSessionActionRecoverySnapshot().actions.map((action) => action.id)).toEqual(
+			snapshot.actions.map((action) => action.id),
+		);
+		restored.activateStagedNextTurnMessages();
+		restored.activateStagedNextTurnMessages();
+		await restored.waitForIdle();
+		expect(terminalNotices(restored)).toHaveLength(1);
+		expect(restored.getPendingNextTurnMessageSnapshots()).toHaveLength(0);
+		expect(restored.unfinishedActionCount).toBe(0);
+		restored.dispose();
+	});
+
+	it("keeps staged context ahead of newer pending context when activated", async () => {
+		const restored = createSession();
+		const earlier = {
+			role: "custom" as const,
+			customType: "context",
+			content: "earlier",
+			display: false,
+			timestamp: 1,
+		};
+		const later = { role: "custom" as const, customType: "context", content: "later", display: false, timestamp: 2 };
+		restored.stagePendingNextTurnMessages([earlier]);
+		restored.restorePendingNextTurnMessages([later]);
+		expect(restored.getPendingNextTurnMessageSnapshots()).toEqual([earlier, later]);
+		restored.activateStagedNextTurnMessages();
+		expect(restored.getPendingNextTurnMessageSnapshots()).toEqual([earlier, later]);
+	});
+
 	it("demotes a pre-admitted terminal action when ACP close suspends before delivery", async () => {
 		const childStarted = deferred<void>();
 		const childCompletion = deferred<void>();

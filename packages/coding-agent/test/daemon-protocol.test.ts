@@ -86,6 +86,37 @@ describe("daemon protocol helpers", () => {
 		}
 	});
 
+	it.each(["stage_next_turn", "commit_restore_next_turn"] as const)(
+		"fails closed before sending %s to an older daemon",
+		async (type) => {
+			const client = new DaemonClient("unused");
+			const wire = vi.fn(async (command: DaemonCommand) => success(command.id, command.type));
+			const state = client as unknown as {
+				socket: { destroyed: boolean };
+				helloMessage: {
+					protocol: typeof DAEMON_PROTOCOL_INFO;
+					schemaRevision: number;
+					serverCapabilities: string[];
+				};
+				requestWire: typeof wire;
+			};
+			state.socket = { destroyed: false };
+			state.requestWire = wire;
+			const command: DaemonCommand =
+				type === "stage_next_turn" ? { type, activeSessionId: "a", messages: [] } : { type, activeSessionId: "a" };
+			state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 38, serverCapabilities: [] };
+			await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+			expect(wire).not.toHaveBeenCalled();
+			state.helloMessage = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 39, serverCapabilities: [] };
+			await expect(client.request(command)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+			expect(wire).not.toHaveBeenCalled();
+			state.helloMessage.serverCapabilities = ["staged_next_turn_recovery"];
+			await expect(client.request(command)).resolves.toMatchObject({ command: type, success: true });
+			expect(wire).toHaveBeenCalledTimes(1);
+			expect(DAEMON_COMMAND_PLANE[type]).toBe("session");
+		},
+	);
+
 	it.each(["mesh_send", "mesh_replace", "mesh_notify"] as const)(
 		"checks new-client/old-supervisor capability for %s",
 		checkMeshCapability,
@@ -276,8 +307,8 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("TM-18 declares runtime reload events without gating the existing reload command", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(38);
-		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-38-repository-root");
+		expect(DAEMON_SCHEMA_REVISION).toBe(39);
+		expect(DAEMON_SCHEMA_ID).toBe("protocol-7-schema-39-staged-next-turn");
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.daemon_hello).toEqual({ minProtocol: 7 });
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_runtime_reloaded).toEqual({
 			minProtocol: 7,

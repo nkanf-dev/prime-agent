@@ -77,8 +77,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 37 adds capability-gated notifications from the daemon-hosted gate-watcher principal
 // and command_not_dispatched failure info for mesh_notify refusals before dispatch.
 // Revision 38 adds optional repository-root metadata to daemon greetings.
-export const DAEMON_SCHEMA_REVISION = 38;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-38-repository-root";
+// Revision 39 adds staged next-turn recovery commands.
+export const DAEMON_SCHEMA_REVISION = 39;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-39-staged-next-turn";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -131,7 +132,8 @@ export type DaemonServerCapability =
 	| "mesh_replacement"
 	| "session_move"
 	| "abort_and_send_queued"
-	| "render_mode";
+	| "render_mode"
+	| "staged_next_turn_recovery";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -180,6 +182,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"acp_mcp_servers",
 	"abort_and_send_queued",
 	"render_mode",
+	"staged_next_turn_recovery",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -516,6 +519,8 @@ export type DaemonCommand =
 			prefixMessages?: CustomMessage[];
 	  }
 	| { id?: string; type: "restore_next_turn"; activeSessionId: string; messages: CustomMessage[] }
+	| { id?: string; type: "stage_next_turn"; activeSessionId: string; messages: CustomMessage[] }
+	| { id?: string; type: "commit_restore_next_turn"; activeSessionId: string }
 	| { id?: string; type: "restore_actions"; activeSessionId: string; snapshot: SessionActionRecoverySnapshot }
 	| {
 			id?: string;
@@ -813,6 +818,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	steer: SESSION_INPUT_ADMISSION_COMMAND,
 	follow_up: SESSION_INPUT_ADMISSION_COMMAND,
 	restore_next_turn: LEGACY_DAEMON_COMMAND,
+	stage_next_turn: { minProtocol: 7, minSchemaRevision: 39, capability: "staged_next_turn_recovery" },
+	commit_restore_next_turn: { minProtocol: 7, minSchemaRevision: 39, capability: "staged_next_turn_recovery" },
 	restore_actions: LEGACY_DAEMON_COMMAND,
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
@@ -959,6 +966,8 @@ export const DAEMON_COMMAND_PLANE = {
 	steer: "session",
 	follow_up: "session",
 	restore_next_turn: "session",
+	stage_next_turn: "session",
+	commit_restore_next_turn: "session",
 	restore_actions: "session",
 	append_custom_message: "session",
 	resume_queue: "session",

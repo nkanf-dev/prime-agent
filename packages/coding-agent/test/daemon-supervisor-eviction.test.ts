@@ -188,6 +188,38 @@ describe("daemon supervisor whole-tree eviction", () => {
 		expect([...supervisor.workers.keys()].sort()).toEqual(["active", "attached", "blind-heartbeat", "cron"]);
 	});
 
+	it("uses the fenced worker refresh when pending context arrives before the roster catches up", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const idle = makeSummary("pending-root", now);
+		const worker = makeWorker("pending", [idle]);
+		supervisor.workers.set("pending", worker);
+		seedSupervisorRoster(supervisor, worker);
+		worker
+			.client!.request.mockResolvedValueOnce(success(undefined, "list", { sessions: [idle] }))
+			.mockResolvedValue(success(undefined, "list", { sessions: [{ ...idle, isSessionActive: true }] }));
+		await supervisor.runIdleEvictionSweep(now);
+		expect(worker.client!.request).toHaveBeenCalledTimes(2);
+		expect(supervisor.stopWorker).not.toHaveBeenCalled();
+		expect(supervisor.workers.get("pending")).toBe(worker);
+	});
+
+	it("keeps the worker resident when pending context arrives before any roster row is published", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const idle = makeSummary("pending-root", now);
+		const worker = makeWorker("pending", [idle]);
+		supervisor.workers.set("pending", worker);
+		// No seeded roster entry: only the freshly pulled summaries know this worker.
+		worker
+			.client!.request.mockResolvedValueOnce(success(undefined, "list", { sessions: [idle] }))
+			.mockResolvedValue(success(undefined, "list", { sessions: [{ ...idle, isSessionActive: true }] }));
+		await supervisor.runIdleEvictionSweep(now);
+		expect(worker.client!.request).toHaveBeenCalledTimes(2);
+		expect(supervisor.stopWorker).not.toHaveBeenCalled();
+		expect(supervisor.workers.get("pending")).toBe(worker);
+	});
+
 	it("keeps a custom-dir worker resident when a heartbeat lands during the eviction drain", async () => {
 		const now = Date.parse("2026-08-01T12:00:00.000Z");
 		const supervisor = makeSupervisor();

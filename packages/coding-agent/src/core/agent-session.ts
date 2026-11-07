@@ -1600,6 +1600,8 @@ export class AgentSession {
 	// Checkpoint, handoff, and activity waiters share lifecycle-edge notifications to avoid polling.
 	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
 	private _pendingNextTurnMessages: CustomMessage[] = [];
+	// Recovery context stays inert until the owner explicitly activates it.
+	private _stagedNextTurnMessages: CustomMessage[] = [];
 
 	private _goalState: GoalState = emptyGoalState();
 	private _goalAccountingStartedAt: number | undefined = undefined;
@@ -5370,6 +5372,7 @@ export class AgentSession {
 			this._deletedRlmChildIds.clear();
 			this._deletedRlmChildRuns.clear();
 			this._pendingNextTurnMessages = [];
+			this._stagedNextTurnMessages = [];
 			const deliveryError = new Error("Session disposed before prompt delivery.");
 			const completionError = new Error("Session disposed before prompt completion.");
 			this._rejectQueuedAgentMessageDeliveries(deliveryError, completionError);
@@ -7106,7 +7109,7 @@ export class AgentSession {
 			if (incomingAgentMessageIds.size > 0) {
 				// A parked prefix is already owned, even while it is being moved into this action.
 				const pendingAgentMessageIds = new Set<string>();
-				for (const message of this._pendingNextTurnMessages) {
+				for (const message of [...this._pendingNextTurnMessages, ...this._stagedNextTurnMessages]) {
 					if (isAgentSessionMessage(message)) pendingAgentMessageIds.add(message.details.id);
 				}
 				for (const message of options.existingPrefixMessages ?? []) {
@@ -8621,7 +8624,9 @@ export class AgentSession {
 	}
 
 	getPendingNextTurnMessageSnapshots(): readonly CustomMessage[] {
-		const messages = this._pendingNextTurnMessages.map((message) => cloneCustomMessage(message));
+		const messages = [...this._stagedNextTurnMessages, ...this._pendingNextTurnMessages].map((message) =>
+			cloneCustomMessage(message),
+		);
 		for (const action of this._actionStore.unfinishedActions()) {
 			if (
 				action.payload.kind !== "turn" ||
@@ -8646,6 +8651,19 @@ export class AgentSession {
 
 	restorePendingNextTurnMessages(messages: readonly CustomMessage[]): void {
 		this._pendingNextTurnMessages.push(...messages.map((message) => cloneCustomMessage(message)));
+		this._flushDeferredRlmTerminalNotices();
+	}
+
+	/** Keep recovery context owned but unavailable to ordinary turns and terminal-notice flushes. */
+	stagePendingNextTurnMessages(messages: readonly CustomMessage[]): void {
+		this._stagedNextTurnMessages.push(...messages.map((message) => cloneCustomMessage(message)));
+	}
+
+	/** Publish staged context exactly once and wake any terminal notices. */
+	activateStagedNextTurnMessages(): void {
+		if (this._stagedNextTurnMessages.length === 0) return;
+		this._pendingNextTurnMessages.unshift(...this._stagedNextTurnMessages);
+		this._stagedNextTurnMessages = [];
 		this._flushDeferredRlmTerminalNotices();
 	}
 

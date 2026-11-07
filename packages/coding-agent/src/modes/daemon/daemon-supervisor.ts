@@ -1501,6 +1501,28 @@ export class DaemonSupervisor {
 	}
 
 	private workerEvictionSnapshot(worker: ResidentWorker): WorkerEvictionSnapshot {
+		// Fresh worker summaries can lead the asynchronous roster publication. Merge
+		// both views conservatively, including when the roster is still empty.
+		const sessions = new Map<string, WorkerEvictionSnapshot["sessions"][number]>();
+		for (const summary of [
+			...this.workerRosterEntries(worker)
+				.filter((entry) => !entry.queuedChild)
+				.map(sessionSummaryFromRosterEntry),
+			...worker.summaries.values(),
+		]) {
+			const activeSessionId = summary.activeSessionId ?? summary.id;
+			const previous = sessions.get(activeSessionId);
+			const lastActivityAt = Date.parse(summary.lastActivityAt ?? "");
+			sessions.set(activeSessionId, {
+				isSessionActive: isSessionSummaryBusy(summary) || previous?.isSessionActive === true,
+				attachedClients: Math.max(
+					this.attachedClientCount(summary, activeSessionId),
+					previous?.attachedClients ?? 0,
+				),
+				hasRegisteredCronJob: summary.hasRegisteredCronJob === true || previous?.hasRegisteredCronJob === true,
+				lastActivityAt: previous ? Math.max(previous.lastActivityAt, lastActivityAt) : lastActivityAt,
+			});
+		}
 		return {
 			lifecycle: worker.descriptor.lifecycle,
 			isConnected: worker.client !== undefined,
@@ -1509,18 +1531,7 @@ export class DaemonSupervisor {
 			isPreparingUpdateRestart:
 				this.updateRestartPhase !== undefined || worker.updateRestartPrepareClient !== undefined,
 			hasWakeBlindSchedule: this.isWakeBlindScheduledWorker(worker),
-			sessions: this.workerRosterEntries(worker)
-				.filter((entry) => !entry.queuedChild)
-				.map(sessionSummaryFromRosterEntry)
-				.map((summary) => {
-					const activeSessionId = summary.activeSessionId ?? summary.id;
-					return {
-						isSessionActive: isSessionSummaryBusy(summary),
-						attachedClients: this.attachedClientCount(summary, activeSessionId),
-						hasRegisteredCronJob: summary.hasRegisteredCronJob === true,
-						lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
-					};
-				}),
+			sessions: [...sessions.values()],
 		};
 	}
 

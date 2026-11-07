@@ -1087,10 +1087,7 @@ async function restoreNextTurnMessages(
 	if (messages.length === 0) {
 		return;
 	}
-	const response = await client.request(
-		{ type: "restore_next_turn", activeSessionId, messages: [...messages] },
-		30000,
-	);
+	const response = await client.request({ type: "stage_next_turn", activeSessionId, messages: [...messages] }, 30000);
 	if (!response.success) {
 		throw new Error(`restore_next_turn failed for ${sessionFile}: ${response.error}`);
 	}
@@ -1185,8 +1182,6 @@ async function restoreDaemonUpdateRestartSession(
 	} catch (error: unknown) {
 		return { restored: false, resumed: false, failureMessage: `restore_next_turn: ${formatUnknownError(error)}` };
 	}
-	if (!session.shouldResume) return { restored: true, resumed: false };
-
 	const needsContinuationPrompt =
 		session.wasStreaming ||
 		session.wasCompacting ||
@@ -1209,6 +1204,19 @@ async function restoreDaemonUpdateRestartSession(
 			return { restored: false, resumed: false, failureMessage: `restore_actions: ${formatUnknownError(error)}` };
 		}
 	}
+	if (session.queue.nextTurn.length > 0) {
+		try {
+			const response = await client.request({ type: "commit_restore_next_turn", activeSessionId }, 30000);
+			if (!response.success) throw new Error(response.error);
+		} catch (error: unknown) {
+			return {
+				restored: false,
+				resumed: false,
+				failureMessage: `commit_restore_next_turn: ${formatUnknownError(error)}`,
+			};
+		}
+	}
+	if (!session.shouldResume) return { restored: true, resumed: false };
 	const restoredAcceptedTurn =
 		restoredQueuedWork &&
 		session.queue.actions.actions.some(
@@ -1237,14 +1245,14 @@ async function restoreDaemonUpdateRestartSession(
 		if (response.success) {
 			resumedSession = true;
 		} else {
-			resumeFailure = `resume_queue: ${response.error}`;
+			resumeFailure = [resumeFailure, `resume_queue: ${response.error}`].filter(Boolean).join("; ");
 			console.error(
 				chalk.yellow(`Warning: could not resume queued work for ${session.sessionFile}: ${response.error}`),
 			);
 		}
 	}
-	if (!resumedSession && resumeFailure) {
-		return { restored: false, resumed: false, failureMessage: resumeFailure };
+	if (resumeFailure) {
+		return { restored: false, resumed: resumedSession, failureMessage: resumeFailure };
 	}
 	return { restored: true, resumed: resumedSession };
 }

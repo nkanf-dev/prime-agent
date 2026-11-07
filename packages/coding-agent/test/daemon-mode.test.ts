@@ -2613,6 +2613,40 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it.each(["selected", "fence"] as const)(
+		"does not passivate a child with next-turn context at the %s snapshot",
+		async (boundary) => {
+			const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passivation-next-turn-"));
+			try {
+				const fixture = makePersistedRlmDaemonFixture(tempDir);
+				const internals = fixture.daemon as unknown as {
+					sessions: Map<string, ActiveSessionState>;
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+					listPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+					passivateIdleChildren(threshold: number, now: number, limit: number): Promise<number>;
+				};
+				const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+				const child = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+				const snapshots = vi.mocked(child.runtime.session.getPendingNextTurnMessageSnapshots);
+				const message = {
+					role: "custom" as const,
+					customType: "context",
+					content: "owned",
+					display: false,
+					timestamp: 1,
+				};
+				if (boundary === "selected") snapshots.mockReturnValue([message]);
+				else snapshots.mockReturnValueOnce([]).mockReturnValue([message]);
+				internals.listPassiveRlmSubagents = vi.fn(async () => []);
+				await expect(internals.passivateIdleChildren(90, Date.parse("2036-08-01T12:00:00Z"), 1)).resolves.toBe(0);
+				expect(internals.sessions.get(child.activeSessionId)).toBe(child);
+				expect(parent.runtime.session.releaseRlmChildSession).not.toHaveBeenCalled();
+			} finally {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("does not passivate a child that starts streaming during the fence snapshot", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passivation-stream-race-"));
 		try {
@@ -3482,6 +3516,7 @@ function makeRuntimeSession(
 		setSubagentRuntimeHost: vi.fn(),
 		getRlmChildRunStatus: vi.fn(() => "running"),
 		getRlmChildSnapshots: vi.fn(() => []),
+		getPendingNextTurnMessageSnapshots: vi.fn(() => []),
 		registerRlmChildSession: vi.fn(() => true),
 		releaseRlmChildSession: vi.fn(() => vi.fn()),
 		subscribe: vi.fn(() => vi.fn()),

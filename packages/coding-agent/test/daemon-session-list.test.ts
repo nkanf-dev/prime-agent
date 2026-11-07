@@ -85,6 +85,21 @@ describe("buildSessionList", () => {
 		expect(summary).toMatchObject(expected);
 	});
 
+	it("marks a session with staged or pending context busy in refreshed summaries", () => {
+		const state = makeState({ activeSessionId: "pending" });
+		let pending = false;
+		state.runtime.session.getPendingNextTurnMessageSnapshots = () =>
+			pending ? [{ role: "custom", customType: "context", content: "owned", display: false, timestamp: 1 }] : [];
+		const idle = summaryForActiveSession(state);
+		expect(idle.isSessionActive).toBe(false);
+		pending = true;
+		const busy = summaryForActiveSession(state);
+		expect(busy.isSessionActive).toBe(true);
+		expect(busy).not.toBe(idle);
+		pending = false;
+		expect(summaryForActiveSession(state).isSessionActive).toBe(false);
+	});
+
 	it("counts direct peers separately so the supervisor can add them to its own attachment count", () => {
 		const state = makeState({ activeSessionId: "direct", sessionFile: "/tmp/direct.jsonl" });
 		state.clients.add({ id: "supervisor", authenticationRole: "supervisor" } as unknown as DaemonSocketClient);
