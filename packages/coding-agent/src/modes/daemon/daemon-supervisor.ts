@@ -356,6 +356,14 @@ interface ResidentWorker {
 	rosterRepairPull?: Promise<void>;
 }
 
+interface NativeMeshPassiveEndpoint {
+	id: string;
+	parentId: string | null;
+	summary: SessionSummary;
+	rootPath: string;
+	rootSessionId: string;
+}
+
 interface SnapshotDuplicateValidation {
 	promise: Promise<void>;
 	resolve: () => void;
@@ -4409,6 +4417,128 @@ export class DaemonSupervisor {
 		return qualified;
 	}
 
+	/** Saved roots and ledger children remain addressable even without a resident worker. */
+	private async nativePassiveEndpoints(): Promise<NativeMeshPassiveEndpoint[]> {
+		const config = this.nativeMeshConfig;
+		if (!config) return [];
+		const [saved, edges] = await Promise.all([
+			this.catalog.list(undefined, this.defaultSessionConfig.sessionDir),
+			this.rlmSpawnLedger().liveEdges(),
+		]);
+		const byPath = new Map<string, SessionInfo>();
+		for (const info of saved) byPath.set(canonicalSessionPath(info.path), info);
+		// The catalog normally lists roots. The ledger owns subagent topology.
+		for (const edge of edges) {
+			for (const path of [edge.parent, edge.child]) {
+				const key = canonicalSessionPath(path);
+				if (byPath.has(key)) continue;
+				const info = await readSessionInfo(path).catch(() => null);
+				if (info) byPath.set(key, info);
+			}
+		}
+		const parents = new Map<string, string>();
+		const ambiguous = new Set<string>();
+		for (const edge of edges) {
+			const child = canonicalSessionPath(edge.child);
+			const parent = canonicalSessionPath(edge.parent);
+			if (parents.has(child) && parents.get(child) !== parent) ambiguous.add(child);
+			parents.set(child, parent);
+		}
+		const counts = new Map<string, number>();
+		for (const info of byPath.values()) counts.set(info.id, (counts.get(info.id) ?? 0) + 1);
+		const occupied = new Set<string>();
+		for (const entry of this.roster().values()) {
+			if (entry.workerId && this.workers.has(entry.workerId)) {
+				const summary = sessionSummaryFromRosterEntry(entry);
+				if (summary.sessionId) occupied.add(summary.sessionId);
+			}
+		}
+		const result: NativeMeshPassiveEndpoint[] = [];
+		for (const [path, info] of byPath) {
+			if (!info.id || counts.get(info.id) !== 1 || occupied.has(info.id)) continue;
+			let current = path;
+			const seen = new Set<string>();
+			let valid = true;
+			while (parents.has(current)) {
+				if (seen.has(current) || ambiguous.has(current)) {
+					valid = false;
+					break;
+				}
+				seen.add(current);
+				current = parents.get(current)!;
+				if (!byPath.has(current)) {
+					valid = false;
+					break;
+				}
+			}
+			const root = byPath.get(current);
+			if (!valid || !root || counts.get(root.id) !== 1) continue;
+			// A child with no ledger chain cannot safely be treated as a root.
+			if (!parents.has(path) && info.rlmDepth > 0) continue;
+			const parent = parents.has(path) ? byPath.get(parents.get(path)!) : undefined;
+			if (parent && counts.get(parent.id) !== 1) continue;
+			try {
+				result.push({
+					id: nativeMeshAgentId(config.machineId, info.id),
+					parentId: parent ? nativeMeshAgentId(config.machineId, parent.id) : null,
+					summary: summaryForInactiveSession(info),
+					rootPath: root.path,
+					rootSessionId: root.id,
+				});
+			} catch {
+				/* Invalid identity cannot be addressed. */
+			}
+		}
+		return result;
+	}
+
+	/** Revalidate the exact saved identity before starting or reusing the root worker. */
+	private async wakeNativeMeshEndpoint(endpoint: NativeMeshPassiveEndpoint): Promise<WorkerMatch> {
+		const current = (await this.nativePassiveEndpoints()).find((item) => item.id === endpoint.id);
+		if (
+			!current ||
+			current.summary.sessionId !== endpoint.summary.sessionId ||
+			canonicalSessionPath(current.summary.sessionFile!) !== canonicalSessionPath(endpoint.summary.sessionFile!) ||
+			canonicalSessionPath(current.rootPath) !== canonicalSessionPath(endpoint.rootPath) ||
+			current.rootSessionId !== endpoint.rootSessionId ||
+			current.parentId !== endpoint.parentId
+		)
+			throw new Error("Native mesh saved target changed");
+		const target = await readSessionInfo(endpoint.summary.sessionFile!);
+		const root = await readSessionInfo(endpoint.rootPath);
+		if (!target || target.id !== endpoint.summary.sessionId || !root || root.id !== endpoint.rootSessionId)
+			throw new Error("Native mesh saved target identity changed");
+		if (!this.findWorkerBySessionFile(endpoint.rootPath)) {
+			const live = findLiveSessionCopy(endpoint.rootPath, this.defaultSessionConfig.agentDir!, (path) =>
+				this.log(`Native message ownership check skipped unreadable lease: ${path}`),
+			);
+			if (live) throw new Error("Native mesh target is live in another daemon");
+		}
+		const worker = await this.createOrReuseWorker("native-mesh", {
+			type: "create",
+			sessionPath: endpoint.rootPath,
+			continueRecent: false,
+		});
+		if (!worker.nativeMeshDeliveryCapable || !worker.client || worker.descriptor.lifecycle !== "ready")
+			throw new Error("Native mesh target worker is unavailable");
+		const rootEntry = this.roster().byActiveSessionId(worker.descriptor.rootActiveSessionId);
+		const rootSummary =
+			this.findSummaryInWorker(worker, endpoint.rootPath) ??
+			(rootEntry ? sessionSummaryFromRosterEntry(rootEntry) : undefined);
+		if (
+			!rootSummary ||
+			rootSummary.sessionId !== endpoint.rootSessionId ||
+			!rootSummary.sessionFile ||
+			canonicalSessionPath(rootSummary.sessionFile) !== canonicalSessionPath(endpoint.rootPath)
+		)
+			throw new Error("Woken worker has no matching native mesh root");
+		const summary =
+			endpoint.summary.sessionId === endpoint.rootSessionId
+				? rootSummary
+				: { ...endpoint.summary, activeSessionId: endpoint.summary.sessionId };
+		return { worker, summary };
+	}
+
 	private nativeObservationDepth(observation: NativeMeshObservation): number | undefined {
 		let depth = 0;
 		let current: NativeMeshObservation | undefined = observation;
@@ -4439,7 +4569,6 @@ export class DaemonSupervisor {
 		return [...this.nativeObservations.values()].flatMap((agent) => {
 			if (
 				agent.hostId === this.nativeMeshConfig!.machineId ||
-				agent.state !== "active" ||
 				Date.now() - Date.parse(agent.lastHeartbeatAt) > 90_000
 			)
 				return [];
@@ -4455,7 +4584,7 @@ export class DaemonSupervisor {
 					isStreaming: false,
 					unfinishedActionCount: 0,
 					rlmDepth: depth,
-					status: "idle" as const,
+					status: agent.state === "active" ? ("idle" as const) : ("inactive" as const),
 					...(agent.parentId ? { parentSessionId: agent.parentId, parentActiveSessionId: agent.parentId } : {}),
 				},
 			];
@@ -4486,7 +4615,14 @@ export class DaemonSupervisor {
 		for (const [id, attempt] of this.nativeAttempts) {
 			if (!attempt.confirming && Date.now() - attempt.started > 120_000) this.nativeAttempts.delete(id);
 		}
-		const endpoints = this.nativeLocalEndpoints();
+		let passive: NativeMeshPassiveEndpoint[] = [];
+		try {
+			passive = await this.nativePassiveEndpoints();
+		} catch {
+			// A catalog failure must not stop delivery to resident sessions.
+			this.log("Native mesh saved-session scan failed; retrying");
+		}
+		const endpoints = [...this.nativeLocalEndpoints(), ...passive];
 		const registered = await Promise.allSettled(
 			endpoints.map(async (endpoint) => {
 				const rawPrefix = process.env.PRIME_AGENT_TEAM_DISPLAY_PREFIX?.trim() || config.machineId || hostname();
@@ -4505,7 +4641,7 @@ export class DaemonSupervisor {
 						agentId: endpoint.summary.sessionId,
 						parentId: endpoint.parentId,
 						name,
-						state: "active",
+						state: "worker" in endpoint ? "active" : "inactive",
 					});
 					nativeMeshDiagnostic.record({ component: "supervisor",
 						stage: "register",
@@ -4643,7 +4779,9 @@ export class DaemonSupervisor {
 					const old = this.nativeAttempts.get(message.requestId);
 					if (
 						old &&
-						(old.confirming || (Date.now() - old.started < 60_000 && old.source === endpoint.worker.client))
+						(old.confirming ||
+							(Date.now() - old.started < 60_000 &&
+								(!("worker" in endpoint) || old.source === endpoint.worker.client)))
 					) {
 						nativeMeshDiagnostic.record({ component: "supervisor",
 							stage: "handoff",
@@ -4677,7 +4815,14 @@ export class DaemonSupervisor {
 						peer: endpoint.id,
 						subject: message.requestId,
 					});
-					const source = endpoint.worker.client;
+					let target: WorkerMatch;
+					try {
+						target = "worker" in endpoint ? endpoint : await this.wakeNativeMeshEndpoint(endpoint);
+					} catch {
+						// Do not acknowledge: a later sweep retries after the session can be opened.
+						continue;
+					}
+					const source = target.worker.client;
 					if (!source) {
 						nativeMeshDiagnostic.record({ component: "supervisor",
 							stage: "handoff",
@@ -4701,7 +4846,7 @@ export class DaemonSupervisor {
 						.requestWorker(
 							{
 								type: "worker_native_mesh_deliver_message",
-								targetActiveSessionId: endpoint.summary.activeSessionId!,
+								targetActiveSessionId: target.summary.activeSessionId!,
 								expectedSessionId: endpoint.summary.sessionId,
 								message: message.text,
 								sender: { clientId: message.from },
@@ -4827,7 +4972,6 @@ export class DaemonSupervisor {
 			if (
 				!target ||
 				target.hostId === this.nativeMeshConfig?.machineId ||
-				target.state !== "active" ||
 				Date.now() - Date.parse(target.lastHeartbeatAt) > 90_000
 			)
 				throw new Error("Message was not stored: native mesh target is unavailable");

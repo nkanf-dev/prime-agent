@@ -64,6 +64,11 @@ function setup() {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			nativeMeshConfig: { machineId: host, url: "http://127.0.0.1", token: "test" },
 			nativeMesh: transport,
+			catalog: { list: vi.fn(async () => []) },
+			rlmSpawnLedger: () => ({ liveEdges: vi.fn(async () => []) }),
+			defaultSessionConfig: {},
+			workers: new Map(),
+			roster: () => ({ values: () => [], byActiveSessionId: () => undefined }),
 			nativeOperations: new NativeMeshOperations(join(directory, "operations")),
 			nativeObservations: new Map(),
 			nativeAttempts: new Map(),
@@ -79,6 +84,40 @@ function setup() {
 		return { supervisor, summary, worker, recipient, id, directory };
 	}
 	return { transport, agents, messages, a: supervisor("host-a", "one"), b: supervisor("host-b", "two") };
+}
+// Exercise the real local-endpoint selection: this session exists on disk but
+// has no resident worker until pending mail wakes it.
+function makePassive(b: ReturnType<typeof setup>["b"], wokeSessionId = "two") {
+	const path = join(b.directory, "two.jsonl");
+	writeFileSync(
+		path,
+		`${JSON.stringify({ type: "session", version: 3, id: "two", timestamp: new Date().toISOString(), cwd: b.directory })}\n`,
+	);
+	const info = {
+		id: "two",
+		path,
+		cwd: b.directory,
+		name: "two",
+		rlmDepth: 0,
+		created: new Date(),
+		modified: new Date(),
+		messageCount: 0,
+		firstMessage: "",
+		allMessagesText: "",
+	};
+	const summary = { ...b.summary, sessionId: wokeSessionId, sessionFile: path };
+	Object.assign(b.worker, { descriptor: { lifecycle: "ready", rootActiveSessionId: summary.activeSessionId } });
+	delete b.supervisor.nativeLocalEndpoints;
+	Object.assign(b.supervisor, {
+		catalog: { list: vi.fn(async () => [info]) },
+		rlmSpawnLedger: () => ({ liveEdges: vi.fn(async () => []) }),
+		workers: new Map(),
+		roster: () => ({ values: () => [], byActiveSessionId: () => undefined }),
+		findWorkerBySessionFile: vi.fn(() => b.worker),
+		findSummaryInWorker: vi.fn(() => summary),
+		createOrReuseWorker: vi.fn(async () => b.worker),
+	});
+	return { path, info, summary };
 }
 function frame(supervisor: any, worker: any, source: any, type: string, requestId: string, attemptToken: string) {
 	supervisor.handleWorkerFrame(
@@ -236,6 +275,168 @@ describe("supervisor native mesh handoff", () => {
 		// A new operation is intentionally distinct, even for identical text.
 		await a.supervisor.sendNativeMeshMessage({ ...command, nativeMeshOperationId: "op-distinct" }, a.summary);
 		expect(messages.size).toBe(2);
+	});
+});
+
+describe("supervisor native mesh inactive delivery", () => {
+	it("stores to a freshly observed inactive remote identity but rejects a stale observation", async () => {
+		const { a, b, transport } = setup();
+		makePassive(b);
+		await a.supervisor.sweepNativeMesh();
+		await b.supervisor.sweepNativeMesh();
+		await a.supervisor.sweepNativeMesh();
+		const observation = a.supervisor.nativeObservations.get(b.id);
+		expect(observation.state).toBe("inactive");
+		const command = { type: "send_message", targetActiveSessionId: b.id, message: "wake me" };
+		const reply = await a.supervisor.sendNativeMeshMessage(command, a.summary);
+		expect(reply.data.deliveryStatus).toBe("stored");
+		expect(transport.store).toHaveBeenCalledOnce();
+		observation.lastHeartbeatAt = new Date(Date.now() - 91_000).toISOString();
+		await expect(a.supervisor.sendNativeMeshMessage(command, a.summary)).rejects.toThrow(/unavailable/i);
+		expect(transport.store).toHaveBeenCalledOnce();
+	});
+
+	it("registers and polls an inactive saved session without waking it when the queue is empty", async () => {
+		const { transport, b } = setup();
+		makePassive(b);
+		await b.supervisor.sweepNativeMesh();
+		expect(transport.register).toHaveBeenCalledWith(
+			expect.objectContaining({
+				hostId: "host-b",
+				agentId: "two",
+				state: "inactive",
+			}),
+		);
+		expect(transport.pending).toHaveBeenCalledWith(b.id);
+		expect(b.supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+		expect(transport.acknowledge).not.toHaveBeenCalled();
+	});
+
+	it("builds passive identities and parent chains from the saved catalog and live spawn ledger", async () => {
+		const { transport, b } = setup();
+		const root = makePassive(b);
+		const childPath = join(b.directory, "child.jsonl");
+		writeFileSync(
+			childPath,
+			`${JSON.stringify({ type: "session", version: 3, id: "child", timestamp: new Date().toISOString(), cwd: b.directory, parentSession: root.path, rlmDepth: 1 })}\n`,
+		);
+		b.supervisor.rlmSpawnLedger = () => ({
+			liveEdges: async () => [{ childId: "child", parent: root.path, child: childPath, depth: 1, name: "child" }],
+		});
+		await b.supervisor.sweepNativeMesh();
+		const childId = nativeMeshAgentId("host-b", "child");
+		expect(transport.register).toHaveBeenCalledWith(
+			expect.objectContaining({
+				hostId: "host-b",
+				agentId: "two",
+				state: "inactive",
+				parentId: null,
+			}),
+		);
+		expect(transport.register).toHaveBeenCalledWith(
+			expect.objectContaining({
+				hostId: "host-b",
+				agentId: "child",
+				state: "inactive",
+				parentId: b.id,
+			}),
+		);
+		expect(transport.pending).toHaveBeenCalledWith(b.id);
+		expect(transport.pending).toHaveBeenCalledWith(childId);
+		expect(b.supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+	});
+
+	it("wakes for pending mail and acknowledges only after the matching persistence frame", async () => {
+		const { transport, a, b } = setup();
+		const passive = makePassive(b);
+		let replyToWorker!: (value: { success: boolean }) => void;
+		b.recipient.requestWorker.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					replyToWorker = resolve;
+				}),
+		);
+		await a.supervisor.sweepNativeMesh();
+		await b.supervisor.sweepNativeMesh();
+		await a.supervisor.sweepNativeMesh();
+		await a.supervisor.sendNativeMeshMessage(
+			{ type: "send_message", targetActiveSessionId: b.id, message: "wake me" },
+			a.summary,
+		);
+		await b.supervisor.sweepNativeMesh();
+		await settle();
+		expect(b.supervisor.createOrReuseWorker).toHaveBeenCalledWith(
+			"native-mesh",
+			expect.objectContaining({
+				type: "create",
+				sessionPath: passive.path,
+				continueRecent: false,
+			}),
+		);
+		const delivery = b.recipient.requestWorker.mock.calls[0]![0] as any;
+		expect(delivery).toMatchObject({
+			type: "worker_native_mesh_deliver_message",
+			expectedSessionId: "two",
+			message: "wake me",
+		});
+		expect(transport.acknowledge).not.toHaveBeenCalled();
+		frame(b.supervisor, b.worker, b.recipient, "native_mesh_message_persisted", delivery.requestId, "wrong-token");
+		frame(
+			b.supervisor,
+			b.worker,
+			{ requestWorker: vi.fn() },
+			"native_mesh_message_persisted",
+			delivery.requestId,
+			delivery.attemptToken,
+		);
+		expect(transport.acknowledge).not.toHaveBeenCalled();
+		frame(
+			b.supervisor,
+			b.worker,
+			b.recipient,
+			"native_mesh_message_persisted",
+			delivery.requestId,
+			delivery.attemptToken,
+		);
+		await settle();
+		expect(transport.acknowledge).toHaveBeenCalledExactlyOnceWith(delivery.requestId);
+		// A persistence frame can arrive before requestWorker returns.
+		replyToWorker({ success: true });
+		await settle();
+	});
+
+	it("does not wake for mail from an unknown identity", async () => {
+		const { transport, messages, b } = setup();
+		makePassive(b);
+		messages.set("untrusted", {
+			requestId: "untrusted",
+			from: nativeMeshAgentId("unknown-host", "unknown"),
+			to: b.id,
+			text: "no",
+			acknowledgedAt: null,
+		});
+		await b.supervisor.sweepNativeMesh();
+		expect(transport.pending).toHaveBeenCalledWith(b.id);
+		expect(b.supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+		expect(b.recipient.requestWorker).not.toHaveBeenCalled();
+		expect(transport.acknowledge).not.toHaveBeenCalled();
+	});
+
+	it("does not hand off or acknowledge when the woken session identity does not match", async () => {
+		const { transport, a, b } = setup();
+		makePassive(b, "other-session");
+		await a.supervisor.sweepNativeMesh();
+		await b.supervisor.sweepNativeMesh();
+		await a.supervisor.sweepNativeMesh();
+		await a.supervisor.sendNativeMeshMessage(
+			{ type: "send_message", targetActiveSessionId: b.id, message: "wake me" },
+			a.summary,
+		);
+		await b.supervisor.sweepNativeMesh();
+		await settle();
+		expect(b.supervisor.createOrReuseWorker).toHaveBeenCalledOnce();
+		expect(b.recipient.requestWorker).not.toHaveBeenCalled();
+		expect(transport.acknowledge).not.toHaveBeenCalled();
 	});
 });
 

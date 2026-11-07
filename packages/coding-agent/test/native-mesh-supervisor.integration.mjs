@@ -145,6 +145,56 @@ print("PYTHON_AGENT_MESSAGE_OK")`;
   .filter(entry => entry.type === 'custom_message' && entry.details?.id === `agentmsg_native-mesh:${sent.data.id}`);
  if(replayed.length !== 1) throw Error('retry duplicated the persisted message');
  console.log('IDEMPOTENT_RETRY',true);
+ // Stop the original resident root through the public daemon command. Keep the
+ // daemon and broker running so an inactive registration can accept mail.
+ const stopped=await b.client.request({type:'kill',activeSessionId:bs.activeSessionId??bs.id},30000);
+ if(!stopped.success)throw Error(`could not stop recipient: ${JSON.stringify(stopped)}`);
+ let inactive=false, observedInactive=false, lastBroker, lastPeers;
+ for(let n=0;n<120;n++){
+  const r=await fetch(`http://127.0.0.1:${port}/v1/native-mesh/agents`,{headers:{authorization:'Bearer '+token}});
+  const data=await r.json(); lastBroker=data;
+  const saved=data.agents?.find(x=>x.id===bid);
+  inactive=r.ok && saved?.state==='inactive' && saved.agentId===bs.sessionId;
+  const peers=await a.client.request({type:'list_agent_peers',workerToken:tokenForWorker},5000); lastPeers=peers;
+  observedInactive=peers.success && peers.data?.peers?.some(p=>p.sessionId===bid && p.status==='inactive');
+  if(inactive && observedInactive)break;
+  await wait(500);
+ }
+ if(!inactive || !observedInactive)throw Error(`stopped recipient not observed inactive: broker=${JSON.stringify(lastBroker)} peers=${JSON.stringify(lastPeers)}`);
+ console.log('STOPPED_ROOT_INACTIVE',true);
+ const wakeCommand={type:'send_message',fromActiveSessionId:as.activeSessionId??as.id,agentOrigin:true,
+  targetActiveSessionId:bid,message:'wake stopped root',nativeMeshOperationId:'stopped-root-wake-op'};
+ const wakeSent=await a.client.request(wakeCommand,30000);
+ if(!wakeSent.success || wakeSent.data?.deliveryStatus!=='stored' || wakeSent.data?.target?.sessionId!==bid ||
+  wakeSent.data?.operationId!==wakeCommand.nativeMeshOperationId || wakeSent.data?.deliveredAt)
+  throw Error(`invalid stopped-root receipt: ${JSON.stringify(wakeSent)}`);
+ let wakeEntries=[];
+ for(let n=0;n<120;n++){
+  if(existsSync(bs.sessionFile)) wakeEntries=readFileSync(bs.sessionFile,'utf8').split('\n').filter(Boolean).map(line=>JSON.parse(line))
+   .filter(entry=>entry.type==='custom_message' && entry.details?.id===`agentmsg_native-mesh:${wakeSent.data.id}`);
+  if(wakeEntries.length)break;
+  await wait(500);
+ }
+ if(wakeEntries.length!==1 || wakeEntries[0].details?.message!==wakeCommand.message || wakeEntries[0].details?.fromRelationship!=='sibling')
+  throw Error(`stopped-root delivery missing or duplicated: ${JSON.stringify(wakeEntries)}`);
+ const header=JSON.parse(readFileSync(bs.sessionFile,'utf8').split('\n')[0]);
+ if(header.type!=='session' || header.id!==bs.sessionId || nativeMeshAgentId('host-b',header.id)!==bid)
+  throw Error(`woken session identity changed: ${JSON.stringify(header)}`);
+ let wakeAck=false;
+ for(let n=0;n<80;n++){
+  const r=await fetch(`http://127.0.0.1:${port}/v1/messages?to=${bid}`,{headers:{authorization:'Bearer '+token}});
+  const data=await r.json();
+  if(r.ok && Array.isArray(data.messages) && !data.messages.some(m=>m.requestId===wakeSent.data.id)){wakeAck=true;break;}
+  await wait(500);
+ }
+ if(!wakeAck)throw Error('broker did not acknowledge stopped-root delivery');
+ const wakeRetry=await a.client.request(wakeCommand,30000);
+ if(!wakeRetry.success || wakeRetry.data?.id!==wakeSent.data.id || wakeRetry.data?.deliveryStatus!=='stored')
+  throw Error(`stopped-root retry changed request identity: ${JSON.stringify(wakeRetry)}`);
+ const wakeReplay=readFileSync(bs.sessionFile,'utf8').split('\n').filter(Boolean).map(line=>JSON.parse(line))
+  .filter(entry=>entry.type==='custom_message' && entry.details?.id===`agentmsg_native-mesh:${wakeSent.data.id}`);
+ if(wakeReplay.length!==1)throw Error('stopped-root retry duplicated persisted message');
+ console.log('STOPPED_ROOT_WOKE_PERSISTED_ACKNOWLEDGED',true);
 } catch(e){console.error('FAIL',e);process.exitCode=1} finally {
  for(const c of clients){try{await c.request({type:'shutdown',force:true},3000)}catch{} c.close()}
  for(const k of kids){if(k.exitCode===null)k.kill('SIGTERM')}
