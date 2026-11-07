@@ -1,8 +1,8 @@
 import type { ImageContent, TextContent, UserMessage } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { spawn } from "child_process";
-import { readFileSync, rmSync, statSync } from "fs";
-import { resolve, sep } from "path";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "fs";
+import { dirname, resolve, sep } from "path";
 import { selectConfig } from "./cli/config-selector.js";
 import {
 	ensureInteractiveDaemonRunning,
@@ -75,6 +75,7 @@ import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 } from "./modes/daemon/daemon-worker-protocol.js";
+import { writeFileAtomicSync } from "./utils/atomic-file.js";
 import { shouldUseWindowsShell } from "./utils/child-process.js";
 import {
 	getLatestPiRelease,
@@ -874,7 +875,34 @@ function parseDaemonUpdateRestartManifest(value: unknown): DaemonUpdateRestartMa
 	};
 }
 
-function clearPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: string): void {
+function restoreAttemptMarkerPath(socketPath: string, agentDir: string): string {
+	return `${getDaemonUpdateRestartManifestPath(socketPath, agentDir)}.restore-attempted`;
+}
+
+function assertNoUnreviewedRestoreAttempt(socketPath: string, agentDir: string): void {
+	const marker = restoreAttemptMarkerPath(socketPath, agentDir);
+	if (existsSync(marker)) {
+		throw new Error(
+			`A daemon restore was already attempted. Inspect the retained manifest and ${marker} before recovery; automatic replay disabled.`,
+		);
+	}
+}
+
+function markRestoreAttempt(socketPath: string, agentDir: string, manifest: DaemonUpdateRestartManifest): void {
+	assertNoUnreviewedRestoreAttempt(socketPath, agentDir);
+	const path = getDaemonUpdateRestartManifestPath(socketPath, agentDir);
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	// Keep a canonical copy even if the predecessor only provided a legacy manifest.
+	writeFileAtomicSync(path, `${JSON.stringify(manifest)}\n`, { mode: 0o600, fsync: true, fsyncDir: true });
+	writeFileAtomicSync(
+		restoreAttemptMarkerPath(socketPath, agentDir),
+		`Restore started; review recovery state before retry.\n`,
+		{ mode: 0o600, fsync: true, fsyncDir: true },
+	);
+}
+
+function clearPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: string): boolean {
+	let cleared = true;
 	for (const manifestPath of [
 		getDaemonUpdateRestartManifestPath(socketPath, agentDir),
 		getLegacyDaemonUpdateRestartManifestPath(agentDir),
@@ -882,8 +910,18 @@ function clearPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: 
 		try {
 			rmSync(manifestPath, { force: true });
 		} catch {
-			// Best effort only; the mtime guard below prevents stale fallback use.
+			cleared = false;
 		}
+	}
+	return cleared;
+}
+
+function finishSuccessfulRestore(socketPath: string, agentDir: string): void {
+	// Leave the marker in place if deletion fails: a stale manifest must not replay.
+	if (clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir)) {
+		rmSync(restoreAttemptMarkerPath(socketPath, agentDir), { force: true });
+	} else {
+		throw new Error("Restored sessions, but could not remove the manifest; recovery state must be reviewed");
 	}
 }
 
@@ -915,12 +953,8 @@ function tryReadPreparedDaemonUpdateRestartManifest(
 	socketPath: string,
 	agentDir: string,
 ): DaemonUpdateRestartManifest | undefined {
-	try {
-		return readPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
-	} catch {
-		clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
-		return undefined;
-	}
+	assertNoUnreviewedRestoreAttempt(socketPath, agentDir);
+	return readPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 }
 
 function hasRestorableDaemonUpdateRestart(manifest: DaemonUpdateRestartManifest | undefined): boolean {
@@ -987,6 +1021,9 @@ async function prepareConnectedDaemonUpdateRestart(
 				await persistPreparedRestartFence();
 				return pendingManifest;
 			}
+			throw new Error(
+				"A prepared restart manifest exists while the daemon may have active sessions; inspect recovery state before proceeding.",
+			);
 		}
 		clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 		startedAt = Date.now();
@@ -1046,19 +1083,17 @@ async function restoreNextTurnMessages(
 	activeSessionId: string,
 	sessionFile: string,
 	messages: readonly CustomMessage[],
-): Promise<boolean> {
+): Promise<void> {
 	if (messages.length === 0) {
-		return true;
+		return;
 	}
 	const response = await client.request(
 		{ type: "restore_next_turn", activeSessionId, messages: [...messages] },
 		30000,
 	);
 	if (!response.success) {
-		console.error(chalk.yellow(`Warning: could not restore pending context for ${sessionFile}: ${response.error}`));
-		return false;
+		throw new Error(`restore_next_turn failed for ${sessionFile}: ${response.error}`);
 	}
-	return true;
 }
 
 interface RestoreDaemonUpdateRestartSessionResult {
@@ -1145,7 +1180,11 @@ async function restoreDaemonUpdateRestartSession(
 			);
 		}
 	}
-	await restoreNextTurnMessages(client, activeSessionId, session.sessionFile, session.queue.nextTurn);
+	try {
+		await restoreNextTurnMessages(client, activeSessionId, session.sessionFile, session.queue.nextTurn);
+	} catch (error: unknown) {
+		return { restored: false, resumed: false, failureMessage: `restore_next_turn: ${formatUnknownError(error)}` };
+	}
 	if (!session.shouldResume) return { restored: true, resumed: false };
 
 	const needsContinuationPrompt =
@@ -1156,18 +1195,18 @@ async function restoreDaemonUpdateRestartSession(
 		session.wasRetrying ||
 		session.hadAcceptedPromptInFlight;
 	let resumedSession = false;
+	let resumeFailure: string | undefined;
 	let restoredQueuedWork = false;
 	if (session.queue.actions.actions.length > 0) {
-		const response = await client.request(
-			{ type: "restore_actions", activeSessionId, snapshot: session.queue.actions },
-			30000,
-		);
-		if (response.success) {
-			restoredQueuedWork = true;
-		} else {
-			console.error(
-				chalk.yellow(`Warning: could not restore queued actions for ${session.sessionFile}: ${response.error}`),
+		try {
+			const response = await client.request(
+				{ type: "restore_actions", activeSessionId, snapshot: session.queue.actions },
+				30000,
 			);
+			if (!response.success) throw new Error(response.error);
+			restoredQueuedWork = true;
+		} catch (error: unknown) {
+			return { restored: false, resumed: false, failureMessage: `restore_actions: ${formatUnknownError(error)}` };
 		}
 	}
 	const restoredAcceptedTurn =
@@ -1187,6 +1226,7 @@ async function restoreDaemonUpdateRestartSession(
 			120000,
 		);
 		if (!promptResponse.success) {
+			resumeFailure = `prompt: ${promptResponse.error}`;
 			console.error(chalk.yellow(`Warning: could not resume ${session.sessionFile}: ${promptResponse.error}`));
 		} else {
 			resumedSession = true;
@@ -1197,10 +1237,14 @@ async function restoreDaemonUpdateRestartSession(
 		if (response.success) {
 			resumedSession = true;
 		} else {
+			resumeFailure = `resume_queue: ${response.error}`;
 			console.error(
 				chalk.yellow(`Warning: could not resume queued work for ${session.sessionFile}: ${response.error}`),
 			);
 		}
+	}
+	if (!resumedSession && resumeFailure) {
+		return { restored: false, resumed: false, failureMessage: resumeFailure };
 	}
 	return { restored: true, resumed: resumedSession };
 }
@@ -1209,7 +1253,10 @@ async function restoreDaemonUpdateRestart(
 	socketPath: string,
 	manifest: DaemonUpdateRestartManifest,
 	restartOriginActiveSessionId?: string,
-	onProgress?: (progress: RestoreDaemonUpdateRestartResult) => void,
+	onProgress?: (
+		progress: RestoreDaemonUpdateRestartResult,
+		checkpoint: { sessionFile: string; activeSessionId?: string; failure?: string },
+	) => void,
 ): Promise<RestoreDaemonUpdateRestartResult> {
 	const restoredActiveSessionIds = new Map<string, string>();
 	if (manifest.sessions.length === 0) {
@@ -1222,6 +1269,7 @@ async function restoreDaemonUpdateRestart(
 	try {
 		await client.connect(10000);
 		for (const session of manifest.sessions) {
+			let failure: string | undefined;
 			try {
 				const result = await restoreDaemonUpdateRestartSession(
 					client,
@@ -1236,23 +1284,29 @@ async function restoreDaemonUpdateRestart(
 					resumed++;
 				}
 				if (!result.restored) {
-					failures.push({
-						sessionFile: session.sessionFile,
-						message: result.failureMessage ?? "unknown restore error",
-					});
+					failure = result.failureMessage ?? "unknown restore error";
+					failures.push({ sessionFile: session.sessionFile, message: failure });
 				}
 			} catch (error: unknown) {
 				const message = formatUnknownError(error);
 				console.error(chalk.yellow(`Warning: could not restore ${session.sessionFile}: ${message}`));
+				failure = message;
 				failures.push({ sessionFile: session.sessionFile, message });
 			}
-			onProgress?.({
-				total: manifest.sessions.length,
-				restored,
-				resumed,
-				failed: failures.length,
-				failures: [...failures],
-			});
+			onProgress?.(
+				{
+					total: manifest.sessions.length,
+					restored,
+					resumed,
+					failed: failures.length,
+					failures: [...failures],
+				},
+				{
+					sessionFile: session.sessionFile,
+					activeSessionId: restoredActiveSessionIds.get(session.activeSessionId),
+					...(failure ? { failure } : {}),
+				},
+			);
 		}
 	} finally {
 		client.close();
@@ -1366,11 +1420,22 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			});
 			return statusWriter.current();
 		}
+		assertNoUnreviewedRestoreAttempt(options.socketPath, options.agentDir);
 		shutdownAdmission = await acquireDaemonShutdownAdmission();
 		const daemonProbe = await probeRunningDaemonSessions(options.socketPath);
 		// A clean shutdown deletes the saved supervisor config, so read the start folder first.
 		const savedCwd = readPersistedDaemonFolders(options.agentDir, options.socketPath)?.cwd;
-		const reportRestoreProgress = (progress: RestoreDaemonUpdateRestartResult) => {
+		const checkpoints: { sessionFile: string; activeSessionId?: string; failure?: string }[] = [];
+		const reportRestoreProgress = (
+			progress: RestoreDaemonUpdateRestartResult,
+			checkpoint: { sessionFile: string; activeSessionId?: string; failure?: string },
+		) => {
+			checkpoints.push(checkpoint);
+			writeFileAtomicSync(
+				restoreAttemptMarkerPath(options.socketPath, options.agentDir),
+				`${JSON.stringify({ statusPath: options.statusPath, progress, checkpoints })}\n`,
+				{ mode: 0o600, fsync: true, fsyncDir: true },
+			);
 			const { failures, ...counts } = progress;
 			statusWriter.update({ counts, failures });
 		};
@@ -1413,6 +1478,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				if (remainingDaemon.reachable) {
 					if (manifest) {
 						try {
+							markRestoreAttempt(options.socketPath, options.agentDir, manifest);
 							const restoreResult = await restoreDaemonUpdateRestart(
 								options.socketPath,
 								manifest,
@@ -1420,13 +1486,15 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 								reportRestoreProgress,
 							);
 							const { failures: restoreFailures, ...counts } = restoreResult;
-							clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+							if (restoreResult.failed === 0) finishSuccessfulRestore(options.socketPath, options.agentDir);
 							statusWriter.update({
 								counts,
 								...(restoreFailures.length > 0 ? { failures: restoreFailures } : {}),
 							});
-						} catch {
-							// Keep the manifest for a later recovery attempt when fallback restoration fails.
+						} catch (error: unknown) {
+							throw new Error(
+								`Could not stop the predecessor daemon on ${options.socketPath}; fallback restore failed: ${formatUnknownError(error)}`,
+							);
 						}
 					}
 					throw new Error(`Could not stop the predecessor daemon on ${options.socketPath}`);
@@ -1460,6 +1528,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 		let counts: DaemonUpdateRestartCounts = { total: 0, restored: 0, resumed: 0, failed: 0 };
 		let failures: DaemonUpdateRestartFailure[] = [];
 		if (manifest) {
+			markRestoreAttempt(options.socketPath, options.agentDir, manifest);
 			const restoreResult = await restoreDaemonUpdateRestart(
 				options.socketPath,
 				manifest,
@@ -1473,15 +1542,15 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				failed: restoreResult.failed,
 			};
 			failures = restoreResult.failures;
-			clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			if (restoreResult.failed === 0) finishSuccessfulRestore(options.socketPath, options.agentDir);
 		}
 		statusWriter.update({
-			phase: "complete",
+			phase: counts.failed > 0 ? "failed" : "complete",
 			counts,
 			...(failures.length > 0 ? { failures } : {}),
 			message:
 				counts.failed > 0
-					? `Restarted the daemon with ${counts.failed} session restore failure${counts.failed === 1 ? "" : "s"}`
+					? `Restarted the daemon with ${counts.failed} session restore failure${counts.failed === 1 ? "" : "s"}; retained recovery manifest at ${getDaemonUpdateRestartManifestPath(options.socketPath, options.agentDir)}`
 					: "Restarted the daemon after the update",
 		});
 	} catch (error: unknown) {

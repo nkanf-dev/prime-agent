@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -160,6 +160,7 @@ const mockState = vi.hoisted(() => ({
 	helloWaitFailures: 0,
 	restoreActionFailures: 0,
 	restoreNextTurnFailures: 0,
+	markerAtRestore: [] as boolean[],
 	socketPath: "",
 	successorProcessStartId: "replacement-start" as string | undefined,
 	successorSocketPath: undefined as string | undefined,
@@ -339,6 +340,9 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 			this.observedHello ??= mockState.hello;
 			mockState.calls.push(`daemon-request:${request.type}`);
 			mockState.requestPayloads.push(request);
+			if (request.type === "restore_next_turn" || request.type === "restore_actions") {
+				mockState.markerAtRestore.push(existsSync(`${mockState.preparedManifestPath}.restore-attempted`));
+			}
 			if (mockState.disconnectRequestTypes.includes(request.type)) {
 				this.connected = false;
 				throw new Error(`${request.type} disconnected`);
@@ -503,6 +507,7 @@ describe("self-update daemon restart", () => {
 		mockState.requestPayloads = [];
 		mockState.restoreActionFailures = 0;
 		mockState.restoreNextTurnFailures = 0;
+		mockState.markerAtRestore = [];
 		mockState.spawnExitCodes = [];
 		mockState.shutdownResult = true;
 		mkdirSync(agentDir, { recursive: true });
@@ -560,13 +565,12 @@ describe("self-update daemon restart", () => {
 	it.each([
 		["unreadable", "{"],
 		["unknown-format", JSON.stringify({ formatVersion: 0, createdAt: "stale", sessions: [] })],
-	])("ignores a %s pending restart manifest when probing", async (_name, contents) => {
+	])("retains and rejects a %s pending restart manifest when probing", async (_name, contents) => {
 		writeFileSync(mockState.preparedManifestPath, contents);
 
-		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).resolves.toEqual(
-			mockState.prepareManifest,
-		);
-		expect(mockState.calls).toContain("daemon-request:prepare_update_restart");
+		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow();
+		expect(readFileSync(mockState.preparedManifestPath, "utf8")).toBe(contents);
+		expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
 	});
 
 	it("uses the interactive no-change sentinel only when self-update is unchanged", async () => {
@@ -1082,7 +1086,9 @@ describe("self-update daemon restart", () => {
 		mockState.requestThrowTypes = ["list"];
 
 		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow("list failed");
+		expect(JSON.parse(readFileSync(mockState.preparedManifestPath, "utf8"))).toEqual(pendingManifest);
 		expect(mockState.calls).not.toContain("persist-daemon-startup-fence");
+		expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
 
 		mockState.calls = [];
 		mockState.requestThrowTypes = [];
@@ -1108,16 +1114,19 @@ describe("self-update daemon restart", () => {
 				],
 			},
 		};
-		mockState.disconnectRequestTypes = ["prepare_update_restart"];
-		writeFileSync(
-			getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir),
-			JSON.stringify(pendingManifest),
-		);
-
-		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow(
-			"prepare_update_restart disconnected",
-		);
-		expect(existsSync(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir))).toBe(false);
+		const unsafeListResponses: MockDaemonResponse[] = [
+			mockState.listResponse,
+			{ success: false, error: "list unavailable" },
+			{ success: true, data: {} },
+		];
+		for (const response of unsafeListResponses) {
+			mockState.calls = [];
+			mockState.listResponse = response;
+			await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow();
+			expect(JSON.parse(readFileSync(mockState.preparedManifestPath, "utf8"))).toEqual(pendingManifest);
+			expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
+			expect(mockState.calls).not.toContain("persist-daemon-startup-fence");
+		}
 	});
 
 	it("skips predecessor fencing when the daemon hello has no fixed-owner identity", async () => {
@@ -1135,22 +1144,70 @@ describe("self-update daemon restart", () => {
 		}
 	});
 
-	it("still resumes accepted prompts when accepted context restore fails", async () => {
-		mockState.restoreActionFailures = 1;
-		mockState.prepareManifest = createAcceptedRecoveryManifest();
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-
-		try {
-			await expect(performUpdateAndRunCoordinator("old-active")).resolves.toBeUndefined();
-
-			expect(mockState.requestPayloads.some((request) => request.type === "restore_actions")).toBe(true);
-			expect(mockState.requestPayloads.some((request) => request.type === "prompt")).toBe(true);
-		} finally {
-			errorSpy.mockRestore();
-			logSpy.mockRestore();
-		}
-	});
+	it.each(["restore_next_turn", "restore_actions"])(
+		"reports %s failure, retains the manifest and does not replay it",
+		async (command) => {
+			const nextTurn: MockCustomMessage = {
+				role: "custom",
+				customType: "test",
+				content: "pending",
+				display: true,
+				timestamp: 1,
+			};
+			mockState.prepareManifest = createAcceptedRecoveryManifest([nextTurn]);
+			if (command === "restore_next_turn") mockState.restoreNextTurnFailures = 1;
+			else mockState.restoreActionFailures = 1;
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			try {
+				await performUpdateAndRunCoordinator("old-active");
+				expect(mockState.lastCoordinatorStatus?.counts).toMatchObject({ total: 1, restored: 0, failed: 1 });
+				expect(mockState.lastCoordinatorStatus?.failures).toEqual([
+					{ sessionFile: join(projectDir, "session.jsonl"), message: expect.stringContaining(command) },
+				]);
+				expect(mockState.lastCoordinatorStatus?.failures?.[0]?.message).toContain("restore failed");
+				expect(JSON.parse(readFileSync(mockState.preparedManifestPath, "utf8"))).toEqual(mockState.prepareManifest);
+				expect(mockState.requestPayloads.map((request) => request.type)).toContain(command);
+				expect(mockState.requestPayloads.some((request) => request.type === "prompt")).toBe(false);
+				expect(mockState.markerAtRestore).not.toContain(false);
+				const markerPath = `${mockState.preparedManifestPath}.restore-attempted`;
+				expect(JSON.parse(readFileSync(markerPath, "utf8"))).toMatchObject({
+					statusPath: join(agentDir, "update-restarts", "test-status.json"),
+					progress: { total: 1, restored: 0, failed: 1 },
+					checkpoints: [
+						{
+							sessionFile: join(projectDir, "session.jsonl"),
+							activeSessionId: "restored-active",
+							failure: expect.stringContaining(command),
+						},
+					],
+				});
+				const requests = mockState.requestPayloads.length;
+				const calls = mockState.calls.length;
+				const second = await runDaemonUpdateRestartCoordinator({
+					socketPath: mockState.socketPath,
+					agentDir,
+					statusPath: join(agentDir, "update-restarts", "second-status.json"),
+				});
+				expect(second.phase).toBe("failed");
+				expect(second.message).toMatch(/automatic replay.*disabled/);
+				expect(mockState.calls.slice(calls)).not.toContain("probe-daemon");
+				expect(
+					mockState.requestPayloads
+						.slice(requests)
+						.filter((request) =>
+							["create", "restore_next_turn", "restore_actions", "prompt", "resume_queue"].includes(
+								request.type,
+							),
+						),
+				).toEqual([]);
+				expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+			} finally {
+				errorSpy.mockRestore();
+				logSpy.mockRestore();
+			}
+		},
+	);
 
 	it("does not replay a continuation after restoring an accepted turn", async () => {
 		mockState.prepareManifest = createAcceptedRecoveryManifest();

@@ -121,9 +121,9 @@ const PROCESS_START_ID_RECHECK_MS = 1000;
 export function buildDaemonUpdateRestartReport(status: DaemonUpdateRestartStatus): DaemonUpdateRestartReport {
 	const report: DaemonUpdateRestartReport = { info: [], warnings: [] };
 	if (status.phase === "failed") {
-		report.warnings.push(`Updated, but could not restart the daemon (${status.message ?? "unknown error"}).`);
+		report.warnings.push(`Daemon update restart failed (${status.message ?? "unknown error"}).`);
 		report.warnings.push(
-			"The daemon still runs the previous version; run `prime-agent shutdown`, then run `prime-agent` to restart and apply the update.",
+			"Inspect the restart status and retained recovery files before restarting; restored sessions may already be active.",
 		);
 	}
 	if (status.phase !== "complete" && status.phase !== "failed") {
